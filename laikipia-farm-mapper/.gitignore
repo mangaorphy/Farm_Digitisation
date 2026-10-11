@@ -10,3 +10,4 @@ reports/*
 !data/**/.gitkeep
 !outputs/.gitkeep
 !reports/.gitkeep
+venv/
