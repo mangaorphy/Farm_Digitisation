@@ -1,0 +1,35 @@
+country: Kenya
+county: Laikipia
+# Illustrative pilot only; replace with your uploaded/authoritative AOI before extraction.
+aoi:
+  source: bbox
+  bbox: [36.74, 0.10, 36.78, 0.14]
+start_date: "2024-01-01"
+end_date: "2024-12-31"
+max_cloud_cover: 20
+satellite_source: sentinel-2-sr-harmonized
+tile_size: 512
+tile_overlap: 64
+segmentation_model: samgeo
+probability_threshold: 0.55
+minimum_farm_area_ha: 0.1
+minimum_mapping_unit_m2: 1000
+target_crs: EPSG:32737
+output_directory: outputs
+kmz_filename: laikipia_farm_polygons.kmz
+training_dataset: null
+workflow: baseline
+imagery:
+  scale_m: 10
+  bands: [B2, B3, B4, B8]
+  suitability_min_short_side_pixels: 5
+  expected_min_farm_width_m: 30
+  allow_unsuitable_inference: false
+model:
+  unet_encoder: resnet34
+  classes: 3
+  checkpoint: data/models/unet_best.pt
+  device: auto
+  samgeo_model: sam_vit_h_4b8939.pth
+export:
+  include_aoi: true
