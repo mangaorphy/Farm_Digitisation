@@ -1,13 +1,18 @@
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
+.DS_Store
 .env
+
+# Large/generated artefacts (keep folders via .gitkeep)
 data/imagery/*
-data/tiles/*
 data/models/*
+data/tiles/*
+data/labels/*.tif
+data/labels/split.json
+data/labels/norm.json
 outputs/*
 reports/*
-!data/**/.gitkeep
-!outputs/.gitkeep
-!reports/.gitkeep
-venv/
+!**/.gitkeep

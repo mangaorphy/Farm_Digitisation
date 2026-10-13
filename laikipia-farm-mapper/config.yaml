@@ -1,35 +1,87 @@
-country: Kenya
-county: Laikipia
-# Illustrative pilot only; replace with your uploaded/authoritative AOI before extraction.
-aoi:
-  source: bbox
-  bbox: [36.74, 0.10, 36.78, 0.14]
-start_date: "2024-01-01"
-end_date: "2024-12-31"
-max_cloud_cover: 20
-satellite_source: sentinel-2-sr-harmonized
-tile_size: 512
-tile_overlap: 64
-segmentation_model: samgeo
-probability_threshold: 0.55
-minimum_farm_area_ha: 0.1
-minimum_mapping_unit_m2: 1000
-target_crs: EPSG:32737
-output_directory: outputs
-kmz_filename: laikipia_farm_polygons.kmz
-training_dataset: null
-workflow: baseline
+# Laikipia farm digitisation: single configuration file.
+# Paths are relative to this file. Every command and the notebook read this file.
+
+project:
+  crs: EPSG:32637          # UTM 37N; covers all of Laikipia. Areas are computed in this CRS.
+  resolution_m: 10         # Sentinel-2 native resolution for the visible/NIR bands
+
+# --- Reference polygons: your manual digitising (training labels + evaluation truth) ---
+reference:
+  polygons:
+    - data/aoi/property_boundaries/Property boundaries.shp
+  # Drop any extra manually digitised .kml/.kmz/.shp/.gpkg/.geojson here (e.g. exported from
+  # Google Earth Pro). They are picked up automatically and override earlier layers.
+  extra_dirs:
+    - data/labels/manual
+  name_field: NAME_96
+  # Pixels further than this from any reference polygon are IGNORED in training/evaluation
+  # (so partially digitised areas do not teach the model that unlabelled farms are background).
+  coverage_buffer_m: 250
+
+# --- Imagery ---
 imagery:
-  scale_m: 10
-  bands: [B2, B3, B4, B8]
-  suitability_min_short_side_pixels: 5
-  expected_min_farm_width_m: 30
-  allow_unsuitable_inference: false
+  # planetary_computer = free Sentinel-2 L2A, no account or API key needed.
+  # local = use your own GeoTIFF (e.g. licensed high-resolution imagery) at `local_path`.
+  source: planetary_computer
+  local_path: null
+  local_bands: null          # e.g. [B, G, R, NIR]; needed only for local files with NDVI
+  output: data/imagery/laikipia_s2.tif   # main training composite
+  dir: data/imagery          # every other .tif here is an extra scene (used for training + retraining)
+  collection: sentinel-2-l2a
+  bands: [B02, B03, B04, B08, B11, B12]
+  date_range: ["2024-01-01", "2024-03-31"]   # dry season: fewest clouds, strongest field contrast
+  max_cloud_cover: 30        # scene-level %, pre-filter
+  max_scenes_per_tile: 6     # least-cloudy scenes per Sentinel-2 tile used in the median
+  chunk_px: 1024             # processing chunk (keeps memory low, enables resume)
+  # Pilot area [min_lon, min_lat, max_lon, max_lat]. Set to null for the whole reference layer
+  # (~13,000 x 12,000 px; plan for many GB of downloads and several hours).
+  bbox: [36.70, 0.10, 37.00, 0.40]
+
+labels:
+  dir: data/labels           # <scene>_labels.tif is written here for every scene
+  boundary_width_px: 3       # drawn width of the "boundary" class (3 px = 30 m)
+
+# --- Spatial hold-out: whole blocks are assigned to train / val / test ---
+split:
+  block_px: 512              # 5 km blocks
+  val_fraction: 0.15
+  test_fraction: 0.15
+  seed: 42
+  file: data/labels/split.json   # persisted so the test set stays fixed when you retrain
+
 model:
-  unet_encoder: resnet34
-  classes: 3
+  encoder: resnet18          # light enough for a CPU laptop. resnet34 is a bit more accurate, ~2x slower
+  encoder_weights: imagenet  # downloaded on first use; set null to train from scratch offline
   checkpoint: data/models/unet_best.pt
-  device: auto
-  samgeo_model: sam_vit_h_4b8939.pth
-export:
-  include_aoi: true
+  add_ndvi: true
+
+train:
+  crop_px: 256
+  batch_size: 8
+  epochs: 20
+  steps_per_epoch: 100
+  val_crops: 160
+  lr: 0.0003
+  finetune_lr: 0.0001        # used when retraining from an existing checkpoint
+  weight_decay: 0.0001
+  class_weights: [1.0, 1.0, 3.0]   # background, farm interior, boundary
+  patience: 8                # early stopping (epochs without val improvement)
+  num_workers: 0
+  device: auto               # auto | cuda | mps | cpu
+  seed: 42
+
+predict:
+  tile_px: 512
+  pad_px: 64                 # context discarded around each tile to avoid edge artefacts
+  tta: true                  # average over horizontal/vertical flips
+
+polygonize:
+  interior_threshold: 0.5    # P(interior) needed to seed a farm
+  boundary_threshold: 0.4    # P(boundary) above this splits neighbouring farms
+  min_area_ha: 5.0
+  simplify_m: 15
+  fill_holes_ha: 1.0
+
+outputs:
+  dir: outputs
+  kmz_name: laikipia_farm_polygons

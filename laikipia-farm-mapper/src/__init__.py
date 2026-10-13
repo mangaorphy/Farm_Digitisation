@@ -1,1 +1,0 @@
-"""Laikipia Farm Mapper modules."""
