@@ -57,6 +57,7 @@ def demo_config(cfg, out_dir, epochs=6):
     c.reference.polygons = [str(out_dir / "demo_reference.gpkg")]
     c.reference.extra_dirs = []
     c.reference.name_field = "NAME_96"
+    c.imagery.bbox = None
     c.imagery.source = "local"
     c.imagery.local_path = str(out_dir / "demo_imagery.tif")
     c.imagery.local_bands = list(cfg.imagery.bands)

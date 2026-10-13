@@ -84,6 +84,7 @@ def evaluate(cfg, scenes=None, checkpoint=None, which="test", progress=print):
             pred_poly = polygonize_probs(cfg, probs_path, progress=lambda *_: None)
             region_geom = unary_union([box(*rasterio.windows.bounds(w, tr)) for w in regions])
             ref = load_reference(cfg, crs=crs)
+            ref = ref[ref["ref_use"]]  # QA-flagged / filtered parcels are not scored
             ref = ref.assign(geometry=ref.intersection(region_geom))
             ref = ref[~ref.geometry.is_empty & (ref.area / 1e4 >= cfg.polygonize.min_area_ha)].reset_index(drop=True)
             pred_poly = gpd.GeoDataFrame(geometry=pred_poly.geometry.intersection(region_geom), crs=crs)

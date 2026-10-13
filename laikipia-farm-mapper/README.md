@@ -3,26 +3,34 @@
 Automates what you do by hand in Google Earth Pro: **satellite image → trained model → one polygon per farm**, exported as KMZ (opens in Google Earth Pro) and GeoPackage (QGIS). The model can be **retrained** with new images and your corrections.
 
 ```
+Laikipia County boundary (open data) ─ defines the area
 Sentinel-2 (free) → cloud-free composite → U-Net: background / farm interior / farm boundary
                                                   ▲
-          your manual polygons (315 properties) ──┘ = training labels
+       YOUR farm polygons from Google Earth Pro ──┘ = training labels
                                                   │
                     probabilities → one polygon per farm → .kmz / .gpkg
 ```
 
-## Read this first: what to expect
+## Read this first
 
-- **Your polygons are the training data.** `data/aoi/property_boundaries/Property boundaries.shp` (315 properties; median ≈ 940 ha, 10th percentile ≈ 48 ha) is turned into masks. The model learns what a boundary looks like from *your* digitising.
-- **Free 10 m Sentinel-2 is adequate at this property size** (a median property is ≈ 300 × 300 px). It is *not* adequate for plots under ~5 ha. For those, use higher-resolution imagery you are licensed to use (`imagery.source: local`).
-- **A boundary can only be found if something visible marks it**: a fence line, road, river, or change of land use or vegetation. Adjacent properties with identical savannah on both sides have no boundary in the image, and no model can find it. Expect merged polygons there. Treat the output as **candidates to review**; correcting is much faster than drawing from scratch.
-- **Do not trust any accuracy number until `evaluate` has been run on real imagery.** It scores only on map blocks the model never trained on.
-- Imagery is **not** taken from Google Earth (terms of service). Sentinel-2 comes from Microsoft Planetary Computer: free, no account or API key.
-- The code was written and syntax-checked but **has not been run end-to-end by its author on real imagery**. Step 3 below (`demo` and `pytest`) exists so you find out immediately, offline, whether the install works.
+- **Two different inputs.**
+  - **Area to map** = the Laikipia County boundary, downloaded automatically (geoBoundaries, CC BY 4.0; OpenStreetMap fallback) to `data/aoi/laikipia_county.geojson`. The old `data/aoi/property_boundaries/` shapefile (ranch/conservancy units) is **not used**.
+  - **Training labels** = your Google Earth Pro file, `data/labels/manual/Digitized - Laikipia_Farms_v3_2026-10-05.kmz` (12,448 parcels: 11,290 "Scheme layer" + 1,158 "Digitized"). Any other KML/KMZ/SHP/GPKG/GeoJSON you add to that folder is used too.
+- **Your file's quality flags are respected.** Parcels with `QA_FLAG` other than `OK` (73: duplicate labels, overlaps, label fixes) are *ignored*: not learned as farms, not learned as background, not scored. Change this under `reference.filters` in `config.yaml`. The "fence" reference lines are skipped.
+- **Resolution is the main risk, and your data shows it.** Measured on your file at 10 m Sentinel-2: **74% of parcels are narrower than 10 pixels, 28% narrower than 5 pixels**, median ≈ 7 px wide (median 0.46 ha). Neighbouring parcels that small cannot be reliably separated at 10 m. Realistic outcomes: larger or isolated parcels and fenced blocks are outlined; clusters of small adjacent plots tend to merge. For a model that separates small plots, you need higher-resolution imagery that you are licensed to use (a commercial provider, or aerial/drone orthomosaics) supplied as GeoTIFF with `imagery.source: local`; the same code trains on it (pixel size is read from the file). Imagery is **not** taken from Google Earth (terms of service).
+- **Scheme-layer parcels may not be registered to the imagery.** Outlines taken from scheme plans are often shifted from the visible fence lines. Run `python -m farmmap check` (or notebook step A4b) after the imagery download: it measures edge strength along each source's outlines at shifts of up to ±40 m. If the scheme layer prefers another shift, train on the traced parcels only: `reference.filters: {QA_FLAG: [OK], SOURCE: [Digitized]}`. Do not skip this check: misregistered labels cap accuracy.
+- **A boundary can only be found if something visible marks it** (fence, hedge, road, river, change of crop). Treat output as **candidates to review**.
+- **Do not trust any accuracy number until `evaluate` has run on real imagery.** It scores only on map blocks the model never trained on.
+- **Test status.** Verified by running: KMZ import of your real file, label building on the pilot area, the registration check, the county boundary, and the config logic. **Not yet run by the author: model training and prediction** (PyTorch could not be installed in the authoring environment). `python -m farmmap demo` and `pytest -q` on your laptop are the first thing to run.
+
+### How the pilot area was chosen
+
+`imagery.bbox` is set to lon 36.45–36.75, lat 0.00–0.30, a 33 × 33 km box holding about 8,200 (two thirds) of your parcels, so a first run downloads and trains on the area where you have most data. Widen it later, or use `null` for the whole county.
 
 ## Setup on Windows (Intel Core i7)
 
 1. **Install Python 3.11** (64-bit) from <https://www.python.org/downloads/windows/>. Tick **“Add python.exe to PATH”**. Python 3.10–3.12 work; 3.13 is not yet supported by all dependencies.
-2. **Copy this whole `laikipia-farm-mapper` folder** to the laptop (USB or cloud). Include `data/aoi/property_boundaries/`: it is not committed to git, so a `git clone` alone would miss it.
+2. **Copy this whole `laikipia-farm-mapper` folder** to the laptop (USB or cloud). It already contains your KMZ in `data/labels/manual/`. (Delete the duplicate `Digitized - Laikipia_Farms_v3…kmz` in the project root if you like; only the copy in `data/labels/manual/` is used.)
 3. Open **PowerShell** in the folder and run:
 
 ```powershell
@@ -61,7 +69,7 @@ jupyter lab
 
 | Part | What it does |
 |---|---|
-| A | Look at your polygons, download Sentinel-2, build labels, see the train/val/test split |
+| A | See the county and your farms, check farm sizes vs resolution, download Sentinel-2, **registration check**, build labels, see the train/val/test split |
 | B | The model and training, with loss and IoU curves |
 | C | Evaluation on unseen blocks, plus a visual model-vs-yours comparison |
 | D | Predict an area → KMZ / GeoPackage |
@@ -73,12 +81,15 @@ Run from the project folder with the venv active. Settings are in `config.yaml`.
 
 | Command | Purpose |
 |---|---|
-| `python -m farmmap info` | Download size for the configured area |
+| `python -m farmmap county` | Download the Laikipia boundary (automatic if missing) |
+| `python -m farmmap info [--county]` | Download size for the configured area (only chunks inside the county count) |
 | `python -m farmmap fetch` | Cloud-free composite → `data/imagery/laikipia_s2.tif` (resumable) |
-| `python -m farmmap labels` | Rebuild label masks for every scene in `data/imagery/` |
+| `python -m farmmap check` | Registration check: do each source's outlines sit on image edges? (run after `fetch`) |
+| `python -m farmmap labels` | Rebuild label masks from `data/labels/manual/` for every scene in `data/imagery/` |
 | `python -m farmmap train` | Train from scratch → `data/models/unet_best.pt` |
 | `python -m farmmap evaluate` | Metrics on held-out test blocks |
-| `python -m farmmap predict --bbox 36.8 0.2 36.9 0.3 --name test1` | Image → polygons (`outputs/test1/`) |
+| `python -m farmmap predict --county` | Image → polygons for the **whole county** (large download) |
+| `python -m farmmap predict --bbox 36.8 0.2 36.9 0.3 --name test1` | Image → polygons for a box (`outputs/test1/`) |
 | `python -m farmmap predict --aoi area.kml --name area1` | Same, for a KML/KMZ/GeoJSON/SHP area |
 | `python -m farmmap predict --imagery my.tif --name x` | Same, using your own GeoTIFF |
 
@@ -95,8 +106,8 @@ The model trains on **every GeoTIFF in `data/imagery/`** together with your poly
    ```powershell
    python -m farmmap predict --imagery data/imagery/area_2.tif --name area_2
    ```
-3. **Correct or add polygons** as you already do. Save as KML/KMZ into `data/labels/manual/`. (`.shp`, `.gpkg`, `.geojson` also work.)
-   - A polygon you draw **replaces** any earlier polygon it covers by more than half.
+3. **Correct or add polygons** as you already do. Save as KML/KMZ into `data/labels/manual/` (use the "New farms" folder of your file, or a new file). (`.shp`, `.gpkg`, `.geojson` also work.)
+   - A polygon you draw **replaces** any earlier polygon it covers by more than half. Files are applied in alphabetical order, later files on top.
    - Areas without polygons nearby are **ignored**, not learned as “no farms”.
    - Digitise whole farms, and be consistent about what counts as a boundary.
 4. **Rebuild labels and fine-tune** from the current model (keeps what it learned):
@@ -131,9 +142,10 @@ How the split protects you: whole 5 km blocks are assigned to train / validation
 config.yaml                          all settings
 farmmap/                             package: imagery, labels, data, model, train, predict, polygonize, evaluate, export
 notebooks/farm_digitisation.ipynb    guided train + retrain notebook
-data/aoi/property_boundaries/        your reference polygons
+data/aoi/laikipia_county.geojson     area to map (downloaded)
+data/aoi/property_boundaries/        old ranch-unit layer, unused (kept for context)
 data/imagery/                        downloaded scenes (generated)
-data/labels/manual/                  put corrections / new polygons here
+data/labels/manual/                  YOUR farm polygons (KML/KMZ from Google Earth Pro) go here
 data/models/                         trained checkpoints (generated)
 outputs/                             polygons and probability rasters (generated)
 tests/                               pytest -q  (offline, synthetic)
@@ -147,4 +159,6 @@ tests/                               pytest -q  (offline, synthetic)
 - **Pretrained weights fail to download (offline)**: set `model.encoder_weights: null`.
 - **Training too slow on CPU**: lower `train.epochs` / `train.steps_per_epoch`, keep `encoder: resnet18`, shrink the `bbox`.
 - **`pip install` fails on rasterio/geopandas**: confirm Python is 3.10–3.12 64-bit (`python --version`).
-- **Whole county**: set `imagery.bbox: null`. This is roughly 13,000 × 12,000 px: many GB of download and a long run. Run `python -m farmmap info` first.
+- **"No farm polygons found"**: export your Google Earth Pro digitising to KML/KMZ and put it in `data/labels/manual/`.
+- **County download fails**: save a Laikipia County GeoJSON (WGS84) as `data/aoi/laikipia_county.geojson` manually.
+- **Whole county**: set `imagery.bbox: null` (or use `predict --county`). The county is roughly 13,000 × 12,000 px: many GB of download and a long run. Run `python -m farmmap info --county` first.

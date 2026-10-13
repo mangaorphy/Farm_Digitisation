@@ -21,13 +21,32 @@ def demo(tmp_path_factory):
     return demo_config(load_config(ROOT / "config.yaml"), out, epochs=3), out
 
 
-def test_real_config_loads_and_reference_is_readable():
+def test_config_loads_and_county_boundary_is_valid():
+    from farmmap.county import load_county
+
+    cfg = load_config(ROOT / "config.yaml")
+    county = load_county(cfg)  # uses the shipped data/aoi/laikipia_county.geojson (downloads only if missing)
+    assert county.crs.to_string() == "EPSG:32637"
+    area_km2 = county.area.iloc[0] / 1e6
+    assert 8000 < area_km2 < 11000  # Laikipia County is ~9,500 km2
+
+
+def test_missing_reference_gives_helpful_error():
     from farmmap.reference import load_reference
 
     cfg = load_config(ROOT / "config.yaml")
-    ref = load_reference(cfg)
-    assert len(ref) > 100 and ref.crs.to_string() == "EPSG:32637"
-    assert ref.geometry.is_valid.all() and not ref.geometry.has_z.any()
+    cfg.reference.extra_dirs = ["data/labels/_does_not_exist"]
+    with pytest.raises(ValueError, match="data/labels/manual"):
+        load_reference(cfg)
+
+
+def test_estimate_skips_chunks_outside_county():
+    from farmmap.imagery import estimate
+
+    cfg = load_config(ROOT / "config.yaml")
+    cfg.imagery.bbox = None
+    est = estimate(cfg)
+    assert est["chunks_to_download"] <= est["chunks_total"] and 8000 < est["area_km2"] < 11000
 
 
 def test_normalisation_keeps_nodata_zero():
@@ -92,3 +111,44 @@ def test_kmz_roundtrips_as_reference(tmp_path, demo):
     kmz = write_kmz(frame, tmp_path / "x.kmz")
     back = read_vector(kmz)
     assert len(back) == 1 and back.geometry.iloc[0].geom_type == "Polygon"
+
+
+KML = """<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+<Folder><name>Existing farms</name>
+ <Placemark><name>A</name><ExtendedData><SchemaData schemaUrl="#farms">
+   <SimpleData name="FARM_ID">LKP-1</SimpleData><SimpleData name="SOURCE">Digitized</SimpleData>
+   <SimpleData name="QA_FLAG">OK</SimpleData></SchemaData></ExtendedData>
+  <Polygon><outerBoundaryIs><LinearRing><coordinates>
+   36.60,0.10,0 36.61,0.10,0 36.61,0.11,0 36.60,0.11,0 36.60,0.10,0</coordinates></LinearRing></outerBoundaryIs>
+   <innerBoundaryIs><LinearRing><coordinates>
+   36.603,0.103,0 36.604,0.103,0 36.604,0.104,0 36.603,0.104,0 36.603,0.103,0</coordinates></LinearRing></innerBoundaryIs>
+  </Polygon></Placemark>
+ <Placemark><name>B</name><ExtendedData><SchemaData schemaUrl="#farms">
+   <SimpleData name="FARM_ID">LKP-2</SimpleData><SimpleData name="SOURCE">Scheme layer</SimpleData>
+   <SimpleData name="QA_FLAG">OVERLAP</SimpleData></SchemaData></ExtendedData>
+  <Polygon><outerBoundaryIs><LinearRing><coordinates>
+   36.62,0.10,0 36.63,0.10,0 36.63,0.11,0 36.62,0.11,0 36.62,0.10,0</coordinates></LinearRing></outerBoundaryIs></Polygon>
+ </Placemark>
+</Folder>
+<Folder><name>Fence</name><Placemark><name>f</name><LineString><coordinates>36.6,0.1,0 36.7,0.2,0</coordinates></LineString></Placemark></Folder>
+</Document></kml>"""
+
+
+def test_kml_with_attributes_holes_lines_and_qa_filter(tmp_path):
+    from farmmap.config import Cfg
+    from farmmap.reference import load_reference, read_vector
+
+    f = tmp_path / "farms.kml"
+    f.write_text(KML)
+    df = read_vector(f)
+    assert len(df) == 2 and list(df.FARM_ID) == ["LKP-1", "LKP-2"]  # the fence line is skipped
+    assert len(df.geometry.iloc[0].interiors) == 1  # hole preserved
+
+    cfg = Cfg({"project": {"crs": "EPSG:32637"},
+               "reference": {"polygons": [str(f)], "extra_dirs": [], "name_field": "FARM_ID",
+                             "filters": {"QA_FLAG": ["OK"]}}})
+    cfg.root = tmp_path
+    ref = load_reference(cfg)
+    assert len(ref) == 2 and list(ref.ref_use) == [True, False]  # flagged parcel kept but not used
+    assert list(ref.ref_name) == ["LKP-1", "LKP-2"]

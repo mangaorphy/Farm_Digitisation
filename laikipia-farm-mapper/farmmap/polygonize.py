@@ -34,13 +34,14 @@ def polygonize_probs(cfg, probs_path, progress=print) -> gpd.GeoDataFrame:
         res = abs(transform.a)
     interior, boundary = p[1], p[2]
     seeds = (interior >= pz.interior_threshold * 255) & (boundary < pz.boundary_threshold * 255)
-    seeds = ndi.binary_opening(seeds, structure=np.ones((3, 3), bool))
+    if pz.get("seed_opening", False):
+        seeds = ndi.binary_opening(seeds, structure=np.ones((3, 3), bool))
     labels, n = ndi.label(seeds)
     del seeds
     if n == 0:
         return gpd.GeoDataFrame({"farm_id": [], "area_ha": [], "confidence": []}, geometry=[], crs=crs)
 
-    min_seed_px = max(4, int(0.3 * pz.min_area_ha * 1e4 / res**2))
+    min_seed_px = max(2, int(0.3 * pz.min_area_ha * 1e4 / res**2))
     sizes = np.bincount(labels.ravel())
     small = sizes < min_seed_px
     small[0] = True

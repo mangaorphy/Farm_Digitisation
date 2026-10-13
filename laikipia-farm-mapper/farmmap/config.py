@@ -20,6 +20,10 @@ class Cfg(dict):
         except KeyError as exc:
             raise AttributeError(key) from exc
 
+    def __setattr__(self, key, value):
+        # cfg.imagery.bbox = None must change the same value that cfg.imagery.get("bbox") reads
+        self[key] = Cfg(value) if isinstance(value, dict) else value
+
     def path(self, value) -> Path:
         """Resolve a config path relative to the config file's folder."""
         p = Path(value)

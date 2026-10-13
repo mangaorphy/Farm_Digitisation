@@ -42,6 +42,22 @@ def _evaluate(model, loader, loss_fn, device):
             "score": float(np.nanmean(iou[1:]))}
 
 
+def _check_scenes_compatible(scenes):
+    import rasterio
+
+    info = []
+    for s in scenes:
+        with rasterio.open(s["imagery"]) as r:
+            info.append((s["name"], r.count, abs(r.transform.a)))
+    n0, c0, r0 = info[0]
+    for n, c, r in info[1:]:
+        if c != c0 or abs(r - r0) / r0 > 0.01:
+            raise ValueError(
+                f"Scene '{n}' ({c} bands, {r:g} m pixels) does not match '{n0}' ({c0} bands, {r0:g} m). "
+                "One model needs one kind of imagery. Keep each imagery type in its own project folder "
+                "(copy config.yaml and use --config), or move the odd scene out of data/imagery/.")
+
+
 def train(cfg, scenes=None, init_checkpoint=None, epochs=None, out_checkpoint=None, progress=print):
     """Train from scratch, or fine-tune from `init_checkpoint` (retraining on new/corrected labels).
 
@@ -60,6 +76,7 @@ def train(cfg, scenes=None, init_checkpoint=None, epochs=None, out_checkpoint=No
     scenes = scenes or list_scenes(cfg)
     if not scenes:
         raise RuntimeError("No scenes with labels found. Run the `fetch` and `labels` steps first.")
+    _check_scenes_compatible(scenes)
     out_ckpt = Path(out_checkpoint or cfg.path(cfg.model.checkpoint))
     epochs = epochs or tc.epochs
     random.seed(tc.seed), np.random.seed(tc.seed), torch.manual_seed(tc.seed)

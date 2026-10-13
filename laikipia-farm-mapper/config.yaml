@@ -5,15 +5,25 @@ project:
   crs: EPSG:32637          # UTM 37N; covers all of Laikipia. Areas are computed in this CRS.
   resolution_m: 10         # Sentinel-2 native resolution for the visible/NIR bands
 
-# --- Reference polygons: your manual digitising (training labels + evaluation truth) ---
+# --- Area to map: the Laikipia County boundary (downloaded automatically on first use) ---
+aoi:
+  county_name: Laikipia
+  county_boundary: data/aoi/laikipia_county.geojson
+
+# --- Reference polygons: YOUR farm polygons digitised in Google Earth Pro ---
+# These are the training labels and the evaluation truth. Export them from Google Earth Pro as
+# KML/KMZ (right-click folder > Save Place As) and drop the files in data/labels/manual/.
+# .shp / .gpkg / .geojson also work. All files there are used automatically.
 reference:
-  polygons:
-    - data/aoi/property_boundaries/Property boundaries.shp
-  # Drop any extra manually digitised .kml/.kmz/.shp/.gpkg/.geojson here (e.g. exported from
-  # Google Earth Pro). They are picked up automatically and override earlier layers.
+  polygons: []
   extra_dirs:
     - data/labels/manual
-  name_field: NAME_96
+  name_field: FARM_ID
+  # Parcels failing these filters are IGNORED (not used as labels, not scored, not learned as
+  # background). QA_FLAG != OK are the parcels your file marks as having an open data check.
+  # Add SOURCE: [Digitized] to train only on parcels traced from imagery (see README).
+  filters:
+    QA_FLAG: [OK]
   # Pixels further than this from any reference polygon are IGNORED in training/evaluation
   # (so partially digitised areas do not teach the model that unlabelled farms are background).
   coverage_buffer_m: 250
@@ -33,13 +43,14 @@ imagery:
   max_cloud_cover: 30        # scene-level %, pre-filter
   max_scenes_per_tile: 6     # least-cloudy scenes per Sentinel-2 tile used in the median
   chunk_px: 1024             # processing chunk (keeps memory low, enables resume)
-  # Pilot area [min_lon, min_lat, max_lon, max_lat]. Set to null for the whole reference layer
+  # Pilot area [min_lon, min_lat, max_lon, max_lat]. Set to null for the whole county
   # (~13,000 x 12,000 px; plan for many GB of downloads and several hours).
-  bbox: [36.70, 0.10, 37.00, 0.40]
+  # Best practice: set this to a box around the farms you have digitised.
+  bbox: [36.45, 0.00, 36.75, 0.30]   # densest area of your digitised farms (~8,000 parcels)
 
 labels:
   dir: data/labels           # <scene>_labels.tif is written here for every scene
-  boundary_width_px: 3       # drawn width of the "boundary" class (3 px = 30 m)
+  boundary_width_px: 1       # width of the "boundary" class. Small parcels need thin lines (1 px = 10 m)
 
 # --- Spatial hold-out: whole blocks are assigned to train / val / test ---
 split:
@@ -78,9 +89,10 @@ predict:
 polygonize:
   interior_threshold: 0.5    # P(interior) needed to seed a farm
   boundary_threshold: 0.4    # P(boundary) above this splits neighbouring farms
-  min_area_ha: 5.0
-  simplify_m: 15
-  fill_holes_ha: 1.0
+  min_area_ha: 0.1           # smallest polygon kept (0.1 ha = 1,000 m2)
+  simplify_m: 3
+  fill_holes_ha: 0.02
+  seed_opening: false        # true removes speckle but also deletes parcels narrower than 3 px
 
 outputs:
   dir: outputs

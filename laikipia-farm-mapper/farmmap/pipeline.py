@@ -54,6 +54,15 @@ def prepare_training_data(cfg: Cfg, progress=print, refetch=False, only=None):
     Call this again after adding scenes or dropping new polygons into data/labels/manual.
     Returns the list of scenes.
     """
+    from .reference import load_reference, resolution_warning, size_report
+
+    # Fail early (before any download) if there are no farm polygons to learn from.
+    rep = size_report(load_reference(cfg), cfg.project.resolution_m)
+    progress(f"Reference farms: {rep}")
+    warn = resolution_warning(rep, cfg.project.resolution_m)
+    if warn:
+        progress("WARNING: " + warn)
+
     main = main_imagery(cfg)
     if cfg.imagery.source != "local" and (refetch or not main.exists() or main.with_suffix(".progress.json").exists()):
         progress("Downloading Sentinel-2 composite ...")

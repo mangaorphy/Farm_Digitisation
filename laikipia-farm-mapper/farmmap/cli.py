@@ -15,18 +15,34 @@ def _cfg(args):
 
 
 def cmd_info(args):
-    from .imagery import aoi_bounds, estimate
+    from .imagery import estimate
 
     cfg = _cfg(args)
-    bounds = aoi_bounds(cfg, bbox=args.bbox)
-    print(json.dumps(estimate(cfg, bounds), indent=2))
+    print(json.dumps(estimate(cfg, _aoi(cfg, args), args.bbox), indent=2))
+
+
+def _aoi(cfg, args):
+    """--county uses the Laikipia boundary file; otherwise --aoi (or None)."""
+    if getattr(args, "county", False):
+        from .county import county_path
+
+        return county_path(cfg)
+    return getattr(args, "aoi", None)
+
+
+def cmd_county(args):
+    from .county import download_county_boundary
+
+    cfg = _cfg(args)
+    p = download_county_boundary(cfg.path(cfg.aoi.county_boundary), cfg.aoi.county_name)
+    print(f"County boundary saved: {p}")
 
 
 def cmd_fetch(args):
     from .imagery import fetch_composite
 
     cfg = _cfg(args)
-    out = fetch_composite(cfg, out_path=args.out, aoi_path=args.aoi, bbox=args.bbox)
+    out = fetch_composite(cfg, out_path=args.out, aoi_path=_aoi(cfg, args), bbox=args.bbox)
     print(f"Imagery: {out}")
 
 
@@ -36,6 +52,19 @@ def cmd_labels(args):
     scenes = prepare_training_data(_cfg(args), only=args.imagery)
     for sc in scenes:
         print(f"Scene {sc['name']}: {sc['labels']}")
+
+
+def cmd_check(args):
+    """Do the polygon outlines sit on visible edges? (per SOURCE)"""
+    from .diagnostics import registration_check
+    from .pipeline import main_imagery
+
+    cfg = _cfg(args)
+    res = registration_check(cfg, args.imagery or main_imagery(cfg), group_by=args.group_by)
+    for name, r in res.items():
+        print(json.dumps({name: {k: v for k, v in r.items() if k != "grid"}}, indent=2))
+    print("Interpretation: best shift should be (0, 0) m. A clearly different best shift or contrast "
+          "<= ~1.0 means those outlines are not registered to the imagery (they are not traced on it).")
 
 
 def cmd_train(args):
@@ -61,13 +90,14 @@ def cmd_predict(args):
     cfg = _cfg(args)
     if args.imagery:
         img = Path(args.imagery)
-    elif args.aoi or args.bbox:
-        name = args.name or (Path(args.aoi).stem if args.aoi else "area")
+    elif args.aoi or args.bbox or args.county:
+        aoi = _aoi(cfg, args)
+        name = args.name or ("laikipia_county" if args.county else Path(args.aoi).stem if args.aoi else "area")
         img = cfg.path(cfg.imagery.dir) / f"{name}.tif"
         if not img.exists() or img.with_suffix(".progress.json").exists():
-            fetch_composite(cfg, out_path=img, aoi_path=args.aoi, bbox=args.bbox)
+            fetch_composite(cfg, out_path=img, aoi_path=aoi, bbox=args.bbox)
     else:
-        sys.exit("Give --aoi FILE, --bbox LON LAT LON LAT or --imagery GEOTIFF.")
+        sys.exit("Give --county, --aoi FILE, --bbox W S E N or --imagery GEOTIFF.")
     name = args.name or img.stem
     res = predict_area(cfg, img, name, checkpoint=args.checkpoint)
     print(f"{len(res['frame'])} farms -> {res['gpkg']}\n  open in Google Earth Pro: {res['kmz']}")
@@ -98,12 +128,18 @@ def main(argv=None):
     p.add_argument("--config", default="config.yaml")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("county", help="download the Laikipia County boundary (done automatically if missing)")
+    s.set_defaults(fn=cmd_county)
+
     s = sub.add_parser("info", help="size of the imagery download for the configured area")
     s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+    s.add_argument("--aoi")
+    s.add_argument("--county", action="store_true", help="whole Laikipia County")
     s.set_defaults(fn=cmd_info)
 
     s = sub.add_parser("fetch", help="download a cloud-free Sentinel-2 composite (resumable)")
     s.add_argument("--aoi", help="GeoJSON/KML/KMZ/SHP polygon of the area")
+    s.add_argument("--county", action="store_true", help="whole Laikipia County")
     s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     s.add_argument("--out")
     s.set_defaults(fn=cmd_fetch)
@@ -111,6 +147,11 @@ def main(argv=None):
     s = sub.add_parser("labels", help="rasterise your manual polygons into training masks (all scenes)")
     s.add_argument("--imagery", help="only this scene")
     s.set_defaults(fn=cmd_labels)
+
+    s = sub.add_parser("check", help="registration check: do polygon outlines sit on image edges?")
+    s.add_argument("--imagery")
+    s.add_argument("--group-by", default="SOURCE")
+    s.set_defaults(fn=cmd_check)
 
     s = sub.add_parser("train", help="train, or retrain with --init to fine-tune")
     s.add_argument("--init", help="checkpoint to fine-tune from")
@@ -125,6 +166,7 @@ def main(argv=None):
 
     s = sub.add_parser("predict", help="imagery -> farm polygons (GeoPackage + KMZ)")
     s.add_argument("--aoi")
+    s.add_argument("--county", action="store_true", help="whole Laikipia County")
     s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     s.add_argument("--imagery", help="use this GeoTIFF instead of downloading")
     s.add_argument("--name")

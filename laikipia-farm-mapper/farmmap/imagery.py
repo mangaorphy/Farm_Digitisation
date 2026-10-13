@@ -16,7 +16,7 @@ from rasterio.transform import from_origin
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window
 
-from .reference import load_reference, read_vector
+from .reference import read_vector
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 # SCL classes treated as unusable: no data, saturated, cloud shadow, cloud (med/high), cirrus, snow
@@ -38,17 +38,25 @@ def grid_for_bounds(bounds, res: float):
     return from_origin(x0, y1, res, res), math.ceil((maxx - x0) / res), math.ceil((y1 - miny) / res)
 
 
-def aoi_bounds(cfg, aoi_path=None, bbox=None):
-    """Bounds (project CRS) of what to download: bbox arg > aoi file > config bbox > reference."""
+def aoi_geometry(cfg, aoi_path=None, bbox=None):
+    """Shapely geometry (project CRS) of the area to cover: bbox arg > aoi file > config bbox > county."""
+    from shapely.geometry import box
+
+    from .county import load_county
+
     crs = cfg.project.crs
     bbox = bbox or (None if aoi_path else cfg.imagery.get("bbox"))
     if bbox:
-        return transform_bounds("EPSG:4326", crs, *bbox, densify_pts=21)
+        return box(*transform_bounds("EPSG:4326", crs, *bbox, densify_pts=21))
     if aoi_path:
         df = read_vector(aoi_path)
         df = df.set_crs("EPSG:4326") if df.crs is None else df
-        return tuple(df.to_crs(crs).total_bounds)
-    return tuple(load_reference(cfg).total_bounds)
+        return df.to_crs(crs).geometry.union_all()
+    return load_county(cfg, crs).geometry.iloc[0]
+
+
+def aoi_bounds(cfg, aoi_path=None, bbox=None):
+    return aoi_geometry(cfg, aoi_path, bbox).bounds
 
 
 def band_positions(cfg):
@@ -63,12 +71,16 @@ def band_positions(cfg):
     return None, None
 
 
-def estimate(cfg, bounds=None):
-    bounds = bounds or aoi_bounds(cfg)
-    _, w, h = grid_for_bounds(bounds, cfg.project.resolution_m)
-    c = cfg.imagery.chunk_px
-    n_chunks = math.ceil(w / c) * math.ceil(h / c)
-    return {"width_px": w, "height_px": h, "chunks": n_chunks, "area_km2": round(w * h * (cfg.project.resolution_m / 1000) ** 2)}
+def estimate(cfg, aoi_path=None, bbox=None):
+    """Grid size and the number of chunks that actually intersect the area."""
+    from shapely.geometry import box
+
+    aoi = aoi_geometry(cfg, aoi_path, bbox)
+    transform, w, h = grid_for_bounds(aoi.bounds, cfg.project.resolution_m)
+    wins = list(chunk_windows(w, h, cfg.imagery.chunk_px))
+    needed = sum(aoi.intersects(box(*rasterio.windows.bounds(x, transform))) for x in wins)
+    return {"width_px": w, "height_px": h, "chunks_total": len(wins), "chunks_to_download": int(needed),
+            "area_km2": round(aoi.area / 1e6)}
 
 
 def _chunk_composite(catalog, cfg, window_bounds, shape, transform, crs):
@@ -136,8 +148,10 @@ def fetch_composite(cfg, out_path=None, aoi_path=None, bbox=None, progress=print
     out_path = Path(out_path) if out_path else cfg.path(ic.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     crs, res = cfg.project.crs, cfg.project.resolution_m
-    bounds = aoi_bounds(cfg, aoi_path, bbox)
-    transform, width, height = grid_for_bounds(bounds, res)
+    from shapely.geometry import box
+
+    aoi = aoi_geometry(cfg, aoi_path, bbox)
+    transform, width, height = grid_for_bounds(aoi.bounds, res)
     nb = len(ic.bands)
     state_file = out_path.with_suffix(".progress.json")
 
@@ -165,6 +179,9 @@ def fetch_composite(cfg, out_path=None, aoi_path=None, bbox=None, progress=print
                 continue
             wb = rasterio.windows.bounds(win, transform)
             wt = rasterio.windows.transform(win, transform)
+            if not aoi.intersects(box(*wb)):  # chunk lies entirely outside the area: nothing to download
+                done.add(i)
+                continue
             try:
                 arr = _chunk_composite(catalog, cfg, wb, (int(win.height), int(win.width)), wt, crs)
             except Exception as exc:  # network hiccup: leave chunk for the next resume
