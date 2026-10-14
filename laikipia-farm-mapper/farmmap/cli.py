@@ -67,6 +67,57 @@ def cmd_check(args):
           "<= ~1.0 means those outlines are not registered to the imagery (they are not traced on it).")
 
 
+def cmd_diagnose(args):
+    """Why is training not improving? Imagery stats + simple baseline + memorise-one-batch test."""
+    from .diagnostics import diagnose
+
+    diagnose(_cfg(args))
+
+
+def cmd_da_predict(args):
+    """Delineate Anything on a GeoTIFF -> GeoPackage + KMZ."""
+    from .delineate import delineate
+    from .export import export_polygons
+    from .pipeline import main_imagery
+
+    cfg = _cfg(args)
+    img = Path(args.imagery) if args.imagery else main_imagery(cfg)
+    name = args.name or f"{img.stem}_da"
+    frame = delineate(cfg, img, upsample=args.upsample)
+    gpkg, kmz = export_polygons(frame, cfg.path(cfg.outputs.dir) / name, f"{cfg.outputs.kmz_name}_{name}")
+    print(f"{len(frame)} fields -> {gpkg}\n  open in Google Earth Pro: {kmz}")
+
+
+def cmd_compare(args):
+    """Same test blocks, same scorer: U-Net vs Delineate Anything (several upsampling factors)."""
+    import pandas as pd
+
+    from .compare import compare_engines
+
+    cfg = _cfg(args)
+    only = {}
+    for item in args.only or []:
+        key, _, vals = item.partition("=")
+        only[key] = vals.split(",")
+    df = compare_engines(cfg, which=args.split, unet_checkpoint=args.checkpoint,
+                         da_upsamples=tuple(args.upsample), polygon_files=args.polygons or (), only=only)
+    pd.set_option("display.width", 200, "display.max_columns", 30)
+    print(df.to_string())
+    out = cfg.path(cfg.outputs.dir) / "compare.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out)
+    print(f"saved {out}")
+
+
+def cmd_prepare(args):
+    """Reproject / drop bands / resample any GeoTIFF so the pipeline can use it."""
+    from .prepare import prepare_imagery
+
+    cfg = _cfg(args)
+    prepare_imagery(args.src, args.dst, crs=args.crs or cfg.project.crs, resolution=args.resolution,
+                    bands=args.bands, resampling=args.resampling)
+
+
 def cmd_train(args):
     from .train import train
 
@@ -152,6 +203,33 @@ def main(argv=None):
     s.add_argument("--imagery")
     s.add_argument("--group-by", default="SOURCE")
     s.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("diagnose", help="sanity checks before/after a failed training run")
+    s.set_defaults(fn=cmd_diagnose)
+
+    s = sub.add_parser("da-predict", help="Delineate Anything on imagery -> polygons (needs requirements-da.txt)")
+    s.add_argument("--imagery")
+    s.add_argument("--name")
+    s.add_argument("--upsample", type=int)
+    s.set_defaults(fn=cmd_da_predict)
+
+    s = sub.add_parser("compare", help="score U-Net vs Delineate Anything on held-out blocks")
+    s.add_argument("--split", default="test", choices=["test", "val"])
+    s.add_argument("--checkpoint", help="U-Net checkpoint (default: model.checkpoint if it exists)")
+    s.add_argument("--upsample", type=int, nargs="+", default=[1, 2, 4], help="DA upsampling factors")
+    s.add_argument("--polygons", nargs="*", help="extra polygon files to score (e.g. official DA output)")
+    s.add_argument("--only", nargs="*", metavar="COL=VAL[,VAL]",
+                   help="score only reference farms with these attribute values, e.g. SOURCE=Digitized")
+    s.set_defaults(fn=cmd_compare)
+
+    s = sub.add_parser("prepare-imagery", help="make your own GeoTIFF usable (CRS, bands, resolution)")
+    s.add_argument("src")
+    s.add_argument("dst")
+    s.add_argument("--crs", help="default: project.crs")
+    s.add_argument("--resolution", type=float, help="output pixel size in metres, e.g. 2")
+    s.add_argument("--bands", type=int, nargs="+", help="1-based bands to keep, e.g. 1 2 3 (drops alpha)")
+    s.add_argument("--resampling", default="bilinear", choices=["nearest", "bilinear", "cubic", "average"])
+    s.set_defaults(fn=cmd_prepare)
 
     s = sub.add_parser("train", help="train, or retrain with --init to fine-tune")
     s.add_argument("--init", help="checkpoint to fine-tune from")

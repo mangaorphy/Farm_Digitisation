@@ -94,6 +94,18 @@ polygonize:
   fill_holes_ha: 0.02
   seed_opening: false        # true removes speckle but also deletes parcels narrower than 3 px
 
+# Delineate Anything (optional engine): needs `pip install -r requirements-da.txt`
+delineate:
+  weights: data/models/DelineateAnythingv2.pt
+  weights_url: https://huggingface.co/MykolaL/DelineateAnything/resolve/main/DelineateAnythingv2.pt
+  upsample: 2                # Sentinel-2 is resampled up before detection; compare 1, 2, 4 with `compare`
+  tile_px: 512               # tile size at native resolution
+  overlap_px: 64
+  imgsz: 640
+  conf: 0.2
+  iou: 0.5
+  stretch_percentiles: [2, 98]
+
 outputs:
   dir: outputs
   kmz_name: laikipia_farm_polygons

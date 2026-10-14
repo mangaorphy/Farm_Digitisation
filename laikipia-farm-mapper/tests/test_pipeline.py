@@ -152,3 +152,114 @@ def test_kml_with_attributes_holes_lines_and_qa_filter(tmp_path):
     ref = load_reference(cfg)
     assert len(ref) == 2 and list(ref.ref_use) == [True, False]  # flagged parcel kept but not used
     assert list(ref.ref_name) == ["LKP-1", "LKP-2"]
+
+
+# ---------------------------------------------------------------- scoring + Delineate Anything wrapper
+
+
+def test_scorer_matches_and_stratifies_by_size():
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    from farmmap.config import Cfg
+    from farmmap.scoring import Scorer
+
+    cfg = Cfg({"reference": {"coverage_buffer_m": 100}})
+    # reference: a 1.0 ha farm (100x100 m) and a 0.04 ha farm (20x20 m)
+    ref = gpd.GeoDataFrame({"ref_use": [True, True]}, crs="EPSG:32637",
+                           geometry=[box(0, 0, 100, 100), box(200, 0, 220, 20)])
+    pred = gpd.GeoDataFrame(crs="EPSG:32637", geometry=[box(5, 5, 100, 100),     # IoU ~0.9: found
+                                                        box(190, 0, 260, 60)])   # IoU ~0.1: not found
+    s = Scorer(cfg)
+    s.add(pred, ref, box(-50, -50, 400, 200))
+    out = s.summary()
+    assert out["n_reference"] == 2 and out["matched_iou50"] == 1
+    assert out["recall"] == 0.5 and out["precision"] == 0.5
+    assert out["recall_0-0.25ha"] == 0.0 and out["recall_1-4ha"] == 1.0
+
+
+def test_delineate_maps_pixel_polygons_to_map_coordinates(tmp_path):
+    """A stand-in detector returns a known pixel square; it must land at the right map position."""
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+    from rasterio.windows import Window
+
+    from farmmap.config import Cfg
+    from farmmap.delineate import delineate
+
+    tr = from_origin(250000, 30000, 10, 10)
+    p = tmp_path / "img.tif"
+    with rasterio.open(p, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint16",
+                       crs="EPSG:32637", transform=tr) as d:
+        d.write(np.random.default_rng(0).integers(500, 3000, (3, 256, 256), dtype=np.uint16))
+    cfg = Cfg({"project": {"crs": "EPSG:32637"},
+               "imagery": {"source": "local", "local_bands": ["R", "G", "B"]},
+               "polygonize": {"min_area_ha": 0.0},
+               "delineate": {"upsample": 1, "tile_px": 128, "overlap_px": 32, "imgsz": 640, "conf": 0.2,
+                             "iou": 0.5, "stretch_percentiles": [2, 98]}})
+    cfg.root = tmp_path
+    calls = []
+
+    def fake(img):  # always "finds" a square at pixels 40..60 of the padded tile
+        calls.append(img.shape)
+        return [(np.array([[40, 40], [60, 40], [60, 60], [40, 60]], float), 0.9)]
+
+    out = delineate(cfg, p, regions=[Window(0, 0, 128, 128)], predictor=fake, progress=lambda *_: None)
+    assert calls and calls[0] == (160, 160, 3)  # 128 core + 2*16 context pad (overlap_px=32)
+    # pad=16 => square at native px 24..44 (core-relative); its centre (34, 34) is inside the 128 core
+    assert len(out) == 1
+    minx, miny, maxx, maxy = out.geometry.iloc[0].bounds
+    assert abs(minx - (250000 + 24 * 10)) < 2 and abs(maxx - (250000 + 44 * 10)) < 2
+    assert abs(maxy - (30000 - 24 * 10)) < 2 and abs(miny - (30000 - 44 * 10)) < 2
+
+
+# ---------------------------------------------------------------- your own imagery (8-bit, alpha, lon/lat)
+
+
+def test_uint8_rgb_with_alpha_in_lonlat_is_prepared_and_accepted(tmp_path):
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from farmmap.data import imagery_problems, to_model_input
+    from farmmap.prepare import prepare_imagery
+    from farmmap.scale import to_unit
+
+    # 8-bit RGBA in geographic coordinates, like a drone orthomosaic exported from a photogrammetry tool
+    src = tmp_path / "ortho.tif"
+    rng = np.random.default_rng(0)
+    data = rng.integers(20, 230, (4, 120, 120), dtype=np.uint8)
+    data[3] = 255  # alpha
+    with rasterio.open(src, "w", driver="GTiff", width=120, height=120, count=4, dtype="uint8",
+                       crs="EPSG:4326", transform=from_origin(36.70, 0.20, 0.00002, 0.00002)) as d:
+        d.write(data)
+    out = prepare_imagery(src, tmp_path / "ortho_utm.tif", crs="EPSG:32637", resolution=2.0, bands=[1, 2, 3],
+                          progress=lambda *_: None)
+    with rasterio.open(out) as r:
+        assert r.crs.to_string() == "EPSG:32637" and r.count == 3 and r.dtypes[0] == "uint8"
+        assert abs(r.transform.a - 2.0) < 1e-6
+        arr = r.read()
+    # 8-bit data must not be rejected as "constant" and must standardise to a sane range
+    refl = to_unit(arr)[:, (arr > 0).any(0)]
+    assert imagery_problems(refl, 1.0) == []
+    norm = {"mean": refl.mean(1).tolist(), "std": (refl.std(1) + 1e-6).tolist(), "red": None, "nir": None}
+    x = to_model_input(arr, norm)
+    assert np.isfinite(x).all() and abs(float(x[:, (arr > 0).any(0)].mean())) < 0.5
+
+
+def test_highres_config_is_complete_and_consistent():
+    from farmmap.delineate import rgb_positions
+    from farmmap.imagery import band_positions
+    from farmmap.pipeline import main_imagery
+
+    cfg = load_config(ROOT / "config_highres.yaml")
+    assert cfg.imagery.source == "local" and main_imagery(cfg).name == "ortho.tif"
+    assert band_positions(cfg) == (None, None)          # RGB only: no NDVI channel
+    assert rgb_positions(cfg) == [0, 1, 2]
+    # nothing is shared with the Sentinel-2 project, so models/labels never mix
+    base = load_config(ROOT / "config.yaml")
+    for a, b in ((cfg.labels.dir, base.labels.dir), (cfg.model.checkpoint, base.model.checkpoint),
+                 (cfg.split.file, base.split.file), (cfg.imagery.dir, base.imagery.dir),
+                 (cfg.outputs.dir, base.outputs.dir)):
+        assert a != b

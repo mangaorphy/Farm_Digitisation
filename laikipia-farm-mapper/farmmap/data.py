@@ -12,9 +12,25 @@ from rasterio.enums import Resampling
 from rasterio.windows import Window
 
 from .imagery import band_positions
+from .scale import to_unit
 from .labels import IGNORE
 
 # ---------------------------------------------------------------- normalisation
+
+
+def imagery_problems(refl: np.ndarray, valid_frac: float) -> list[str]:
+    """Reasons a composite cannot teach a model anything. refl: (bands, n_valid_pixels), 0-1."""
+    out = []
+    if valid_frac < 0.3:
+        out.append(f"only {valid_frac:.0%} of pixels have data (failed or empty download chunks?)")
+    for i, band in enumerate(refl):
+        top = float(band.max())
+        if band.std() < 1e-3 * max(top, 1e-6):
+            out.append(f"band {i} is almost constant (std {band.std():.4g}); the composite carries no signal")
+        if top > 0 and (band >= top).mean() > 0.2:
+            out.append(f"band {i}: {(band >= top).mean():.0%} of pixels sit at the band maximum "
+                       "(saturated or clipped; reflectance scaling problem?)")
+    return out
 
 
 def compute_norm(cfg, imagery_path, sample_px: int = 2_000_000) -> dict:
@@ -26,7 +42,11 @@ def compute_norm(cfg, imagery_path, sample_px: int = 2_000_000) -> dict:
     valid = (data > 0).any(0)
     if not valid.any():
         raise ValueError("Imagery contains no valid pixels.")
-    refl = data[:, valid].astype(np.float32) / 10000.0
+    refl = to_unit(data)[:, valid]
+    problems = imagery_problems(refl, valid.mean())
+    if problems:
+        raise ValueError("The imagery looks unusable for training:\n  - " + "\n  - ".join(problems) +
+                         "\nRe-download it (fetch) and run `python -m farmmap diagnose`.")
     red, nir = band_positions(cfg)
     if not cfg.model.add_ndvi:
         red = nir = None
@@ -47,9 +67,9 @@ def n_channels(norm: dict) -> int:
 
 
 def to_model_input(arr: np.ndarray, norm: dict) -> np.ndarray:
-    """(C,H,W) uint16 reflectance*10000 -> standardised float32 (+NDVI). Nodata becomes 0."""
+    """(C,H,W) raster values -> standardised float32 (+NDVI). Nodata (all bands 0) becomes 0."""
     nodata = ~(arr > 0).any(0)
-    x = arr.astype(np.float32) / 10000.0
+    x = to_unit(arr)
     mean = np.asarray(norm["mean"], np.float32)[:, None, None]
     std = np.asarray(norm["std"], np.float32)[:, None, None]
     chans = [(x - mean) / std]

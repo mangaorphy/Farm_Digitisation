@@ -34,7 +34,7 @@ def _evaluate(model, loader, loss_fn, device):
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             logits = model(x)
-            total += float(loss_fn(logits, y)) * len(x)
+            total += loss_fn(logits, y).item() * len(x)
             n += len(x)
             cm += confusion(logits.argmax(1).cpu().numpy(), y.cpu().numpy())
     iou = iou_from_confusion(cm)
@@ -129,7 +129,7 @@ def train(cfg, scenes=None, init_checkpoint=None, epochs=None, out_checkpoint=No
             opt.zero_grad()
             loss.backward()
             opt.step()
-            run += float(loss)
+            run += loss.item()
             nb += 1
         sched.step()
         m = _evaluate(model, loader_va, loss_fn, device)

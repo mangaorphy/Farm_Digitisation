@@ -93,6 +93,108 @@ Run from the project folder with the venv active. Settings are in `config.yaml`.
 | `python -m farmmap predict --aoi area.kml --name area1` | Same, for a KML/KMZ/GeoJSON/SHP area |
 | `python -m farmmap predict --imagery my.tif --name x` | Same, using your own GeoTIFF |
 
+## Small plots: use higher-resolution imagery (the real fix)
+
+At 10 m, plots under about 0.5 ha are 3–7 pixels wide and cannot be separated by any model. Roughly half of your parcels are in that range. With imagery of **about 3 m or finer** the same pipeline works on them. Everything (labels, training, `check`, `diagnose`, `compare`, retraining) already accepts your own GeoTIFF; the steps below are the whole procedure.
+
+### 1. Get imagery you are licensed to use
+
+Any of these works as long as you have it as a GeoTIFF **and the licence allows analysis and training a model on it**:
+
+| Source | Typical pixel size | Notes |
+|---|---|---|
+| Drone orthomosaic (you or a partner fly it) | 3–10 cm | Best detail, no licence worries, limited area. Resample to 0.5–1 m for speed |
+| Commercial satellite (Planet, Maxar, Airbus or a reseller) | 0.3–3 m | Paid; ask for an *orthorectified, 3-band or 4-band GeoTIFF* and confirm the licence covers ML/derived polygons |
+| Aerial survey / government or NGO orthophotos | 0.1–1 m | Check who owns it and what you may do with it |
+
+Do **not** screenshot or export imagery from Google Earth Pro or Google Maps for this: their terms of service do not allow it.
+
+Cover the area where your parcels are (the notebook map shows it). A pilot of 5 × 5 km is plenty to start, and keeps files small.
+
+### 2. Prepare the file (CRS, bands, size)
+
+The pipeline needs a **projected CRS in metres** (EPSG:32637), no alpha band, and a sensible size. This command does all three and works on large files in chunks:
+
+```bash
+# keep bands 1-3 (drops an alpha band), reproject to UTM 37N, resample to 2 m pixels
+python -m farmmap prepare-imagery path/to/your_ortho.tif data/imagery_hr/ortho.tif --bands 1 2 3 --resolution 2
+```
+
+- Typical band orders: RGB = `1 2 3`; RGB + NIR = `1 2 3 4` (check with your provider).
+- **Choosing the pixel size:** 1–3 m is the sweet spot. Finer than 0.5 m makes files huge and slows CPU training with no benefit for parcels of 30–100 m. 8-bit (0–255) and 16-bit files are both fine.
+- Make one file per area. All files you use together must have the **same pixel size and number of bands**.
+
+### 3. Configure
+
+`config_highres.yaml` is a ready template in separate folders, so it never mixes with the Sentinel-2 project. Open it and edit the lines marked `<-- EDIT`:
+
+| Setting | 3 m pixels | 1 m | 0.5 m |
+|---|---|---|---|
+| `project.resolution_m` | 3 | 1 | 0.5 |
+| `labels.boundary_width_px` | 2 | 5 | 10 |
+| `split.block_px` (about 3 km blocks) | 1024 | 3000 | 6000 |
+| `polygonize.simplify_m` | 1.5 | 1 | 0.5 |
+
+Also set `imagery.local_path` to your prepared file and `imagery.local_bands` to its band order, for example `[R, G, B]` or `[R, G, B, NIR]` (with NIR the model gets an NDVI channel).
+
+### 4. Run it
+
+Add `--config config_highres.yaml` **before** the command name. In a terminal:
+
+```bash
+python -m farmmap --config config_highres.yaml labels      # your polygons -> masks on this imagery
+python -m farmmap --config config_highres.yaml check       # are your outlines registered to THIS imagery?
+python -m farmmap --config config_highres.yaml diagnose    # imagery stats + baseline + memorise-one-batch
+python -m farmmap --config config_highres.yaml train       # train the U-Net
+python -m farmmap --config config_highres.yaml evaluate
+python -m farmmap --config config_highres.yaml compare     # U-Net vs Delineate Anything (needs requirements-da.txt)
+python -m farmmap --config config_highres.yaml predict --imagery data/imagery_hr/ortho.tif --name hr_pilot
+```
+
+**In the notebook:** change the first cell that loads the config to
+
+```python
+cfg = load_config("config_highres.yaml")
+```
+
+and run from the top. Section A4 (download) is not needed: your file is the imagery. Start at **A1**, then **A4b**, **A5**, **A6**, **B0**, and on.
+
+### 5. What to check, in order
+
+1. **`check`**: with sharp imagery the outline-to-edge match is much more telling than at 10 m. If scheme-layer outlines are shifted by several metres, set `reference.filters` to `SOURCE: [Digitized]` for this config (traced on imagery) and re-run `labels`.
+2. **`diagnose`**: must say the data carries signal before you train.
+3. **`compare`**: at 1–3 m, Delineate Anything with `upsample: 1` is a serious contender and needs no training. Look at the recall-by-size columns.
+4. **Retrain/fine-tune** as in the retraining section, adding more areas as scenes in `data/imagery_hr/`.
+
+### Practical limits
+
+- Your parcels outside the area you have imagery for are simply not used (areas without imagery are ignored).
+- Very large rasters make `predict` and polygon extraction memory hungry (they hold a probability map in RAM). For areas over about 20,000 × 20,000 pixels, split the imagery into several files, or resample coarser.
+- Plot-boundary fences, hedges and tracks are visible at 1–3 m; boundaries that exist only on paper (same crop on both sides, no fence) are still not detectable at any resolution.
+
+## Engines: your U-Net vs Delineate Anything
+
+Two ways to turn imagery into polygons are built in, and `compare` scores them on the **same held-out test blocks with the same scorer**, so you choose with evidence:
+
+| Engine | What it is | Needs training? |
+|---|---|---|
+| `unet` | The U-Net in this project, learned from your parcels | Yes |
+| `delineate_anything` | [Delineate Anything v2](https://github.com/Lavreniuk/Delineate-Anything): a pretrained field-instance model (YOLO segmentation) trained on 0.25–10 m imagery. Gives one polygon per field directly | No (zero-shot) |
+
+```powershell
+pip install -r requirements-da.txt              # adds ultralytics; weights (~125 MB) download on first use
+python -m farmmap da-predict --name da_pilot     # polygons + KMZ from the composite
+python -m farmmap compare                        # U-Net and DA at upsample x1, x2, x4 on the test blocks
+python -m farmmap compare --only SOURCE=Digitized   # judge on the kind of farm you still draw by hand
+```
+
+`compare` writes `outputs/compare.csv` with F1, precision, recall, mean IoU and **recall by farm size** (<0.25 ha, 0.25–1, 1–4, >4 ha). Read the size columns: they show exactly where each engine stops working.
+
+Notes:
+- Delineate Anything's code and weights are **AGPL-3.0** (fine for internal analysis; read the licence before distributing a service built on it).
+- Sentinel-2 is resampled up before detection (`delineate.upsample`); the right factor is data dependent, which is why `compare` tries several.
+- The official script (`delineate.py` in its repo) can be run separately; score its GeoPackage with `compare --polygons theirs.gpkg`.
+
 ## Retraining with new images (how the model gets better)
 
 The model trains on **every GeoTIFF in `data/imagery/`** together with your polygons. To improve it:
@@ -139,7 +241,8 @@ How the split protects you: whole 5 km blocks are assigned to train / validation
 ## Project layout
 
 ```
-config.yaml                          all settings
+config.yaml                          all settings (Sentinel-2 project)
+config_highres.yaml                  template for your own higher-resolution imagery
 farmmap/                             package: imagery, labels, data, model, train, predict, polygonize, evaluate, export
 notebooks/farm_digitisation.ipynb    guided train + retrain notebook
 data/aoi/laikipia_county.geojson     area to map (downloaded)
@@ -152,6 +255,8 @@ tests/                               pytest -q  (offline, synthetic)
 ```
 
 ## Troubleshooting
+
+- **Training loss flat (~1.2) and IoU 0.000 for interior/boundary**: the model learned only class frequencies. Run `python -m farmmap diagnose` (notebook step B0). It separates *degenerate imagery*, *a code bug*, and *no usable signal at 10 m* and prints a verdict. Do not just train longer.
 
 - **No scenes / empty composite**: widen `imagery.date_range` or raise `max_cloud_cover` (Laikipia is clearest Jan–Mar and Jul–Sep).
 - **Download interrupted**: run `fetch` again; finished chunks are skipped.

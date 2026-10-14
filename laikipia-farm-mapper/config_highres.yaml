@@ -1,0 +1,91 @@
+# Laikipia farm digitisation: HIGH-RESOLUTION imagery (drone / aerial / commercial satellite).
+# Use with:   python -m farmmap --config config_highres.yaml <command>
+# Everything lives in separate folders so it never mixes with the Sentinel-2 project (one model needs
+# one kind of imagery). Edit the lines marked  <-- EDIT.  Sections not shown inherit nothing:
+# this file is complete on its own.
+
+project:
+  crs: EPSG:32637
+  resolution_m: 3            # <-- EDIT: pixel size of YOUR prepared GeoTIFF in metres (0.5, 1, 3 ...)
+
+aoi:
+  county_name: Laikipia
+  county_boundary: data/aoi/laikipia_county.geojson
+
+reference:
+  polygons: []
+  extra_dirs:
+    - data/labels/manual     # your Google Earth Pro polygons (same files as the Sentinel-2 project)
+  name_field: FARM_ID
+  filters:
+    QA_FLAG: [OK]
+    # SOURCE: [Digitized]    # at high resolution, plan-derived parcels are easier to check; see README
+  coverage_buffer_m: 250
+
+imagery:
+  source: local
+  local_path: data/imagery_hr/ortho.tif      # <-- EDIT: your prepared GeoTIFF (see `prepare-imagery`)
+  local_bands: [R, G, B]                     # <-- EDIT: order of bands in your file, e.g. [R, G, B, NIR]
+  dir: data/imagery_hr       # every other .tif here is another training scene (same pixel size!)
+  output: data/imagery_hr/ortho.tif
+  bbox: null
+
+labels:
+  dir: data/labels_hr
+  boundary_width_px: 2       # <-- EDIT: aim for a 4-8 m wide boundary band: 3 m px -> 2, 1 m px -> 5, 0.5 m px -> 10
+
+split:
+  block_px: 1024             # <-- EDIT: aim for ~3 km blocks: 3 m px -> 1024, 1 m px -> 3000, 0.5 m px -> 6000
+  val_fraction: 0.15
+  test_fraction: 0.15
+  seed: 42
+  file: data/labels_hr/split.json
+
+model:
+  encoder: resnet34
+  encoder_weights: imagenet
+  checkpoint: data/models_hr/unet_best.pt
+  add_ndvi: true             # only used if the file has red and NIR bands (local_bands)
+
+train:
+  crop_px: 256
+  batch_size: 8
+  epochs: 25
+  steps_per_epoch: 150
+  val_crops: 160
+  lr: 0.0003
+  finetune_lr: 0.0001
+  weight_decay: 0.0001
+  class_weights: [1.0, 1.0, 3.0]
+  patience: 8
+  num_workers: 0
+  device: auto
+  seed: 42
+
+predict:
+  tile_px: 512
+  pad_px: 64
+  tta: true
+
+polygonize:
+  interior_threshold: 0.5
+  boundary_threshold: 0.4
+  min_area_ha: 0.03          # 300 m2
+  simplify_m: 1.5            # <-- EDIT: about half a pixel or less
+  fill_holes_ha: 0.01
+  seed_opening: true         # removes speckle; fine at this resolution
+
+delineate:
+  weights: data/models/DelineateAnythingv2.pt
+  weights_url: https://huggingface.co/MykolaL/DelineateAnything/resolve/main/DelineateAnythingv2.pt
+  upsample: 1                # detail is already there; do not upsample
+  tile_px: 640
+  overlap_px: 96
+  imgsz: 640
+  conf: 0.2
+  iou: 0.5
+  stretch_percentiles: [2, 98]
+
+outputs:
+  dir: outputs_hr
+  kmz_name: laikipia_farm_polygons_hr
