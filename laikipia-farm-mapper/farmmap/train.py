@@ -138,14 +138,21 @@ def train(cfg, tiles_dir: Path | None = None, out_dir: Path | None = None, epoch
             "image_bands": n_image_bands(bands), "context_bands": [b for b in bands if (b or "").startswith("ctx:")],
             "gsd_m": gsd, "classes": ["background", "interior", "boundary"], "config": to_plain(cfg)}
 
-    start, best, history = 0, -1.0, []
+    # early stopping: stop when val mIoU has not improved by min_delta for `patience` epochs (null = off)
+    patience = tc.get("patience")
+    patience = int(patience) if patience else None
+    min_delta = float(tc.get("min_delta", 0.0))
+    start, best, gain_epoch, history = 0, -1.0, -1, []
     last = out_dir / "last.pt"
     if resume and last.exists():
-        ck = torch.load(last, map_location=dev)
+        ck = M.load_checkpoint(last, dev)
         net.load_state_dict(ck["state_dict"])
         opt.load_state_dict(ck["optimizer"])
         sched.load_state_dict(ck["scheduler"])
         start, best, history = ck["epoch"] + 1, ck["best"], ck["history"]
+        gain_epoch = ck.get("gain_epoch", max((r["epoch"] for r in history if r["val_miou"] >= best), default=-1))
+        if ck.get("stopped"):
+            start = epochs  # finished by early stopping: nothing left to do
         print(f"Resuming from epoch {start} (best val mIoU {best:.3f})")
 
     print(f"device={dev} train={len(tr_ids)} val={len(va_ids)} chips, {in_ch} bands {bands}, gsd {gsd} m")
@@ -180,17 +187,25 @@ def train(cfg, tiles_dir: Path | None = None, out_dir: Path | None = None, epoch
         row = {"epoch": epoch, "train_loss": run / len(tr), "val_loss": vloss / len(va), "iou_bg": iou[0],
                "iou_interior": iou[1], "iou_boundary": iou[2], "val_miou": miou,
                "lr": opt.param_groups[0]["lr"], "minutes": (time.time() - t0) / 60}
+        row = {k: float(v) if hasattr(v, "item") else v for k, v in row.items()}
         history.append(row)
         print("epoch {epoch:3d}  loss {train_loss:.3f}/{val_loss:.3f}  IoU interior {iou_interior:.3f} "
               "boundary {iou_boundary:.3f}  ({minutes:.1f} min)".format(**row))
+        if miou > best + min_delta or gain_epoch < 0:
+            gain_epoch = epoch  # last epoch with a real gain: the early-stopping counter restarts here
         if miou > best:
             best = miou
             M.save(out_dir / "best.pt", net, {**meta, "epoch": epoch, "val": row})
+        stop = patience is not None and epoch - gain_epoch >= patience
         torch.save({"state_dict": net.state_dict(), "optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
-                    "epoch": epoch, "best": best, "history": history, "meta": meta}, last)
+                    "epoch": epoch, "best": best, "gain_epoch": gain_epoch, "history": history, "meta": meta,
+                    "stopped": stop}, last)
         with open(out_dir / "history.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(history[0]))
             w.writeheader()
             w.writerows(history)
+        if stop:
+            print(f"Early stop at epoch {epoch}: no val mIoU gain > {min_delta} for {patience} epochs")
+            break
     print(f"Best val mIoU (interior+boundary) {best:.3f} -> {out_dir / 'best.pt'}")
     return out_dir / "best.pt"

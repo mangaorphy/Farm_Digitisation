@@ -59,9 +59,21 @@ def load(path: str | Path = "config.yaml", overrides: list[str] | None = None) -
     return cfg
 
 
+def plain(value):
+    """Recursively turn Cfg / Path / numpy values into plain dict, list, str, int, float."""
+    if isinstance(value, dict):
+        return {str(k): plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):  # numpy scalar
+        return value.item()
+    return value
+
+
 def to_plain(cfg) -> dict:
-    """Copy without Path objects (for saving inside model checkpoints)."""
-    out = copy.deepcopy(dict(cfg))
+    """Plain copy of the config (for saving inside model checkpoints)."""
+    out = plain(cfg)
     out.pop("root", None)
-    out["paths"] = {k: str(v) for k, v in cfg.paths.items()}
     return out

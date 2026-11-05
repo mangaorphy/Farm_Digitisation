@@ -32,8 +32,17 @@ def save(path: Path, model, meta: dict) -> None:
     torch.save({"state_dict": model.state_dict(), "meta": meta}, path)
 
 
+def load_checkpoint(path: Path, device: str = "cpu") -> dict:
+    """Checkpoints written by this package. PyTorch >= 2.6 loads with weights_only=True by default, which rejects
+    the metadata saved by older versions (config objects, numpy numbers); these files are our own, so allow it."""
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:  # torch < 1.13 has no weights_only argument
+        return torch.load(path, map_location=device)
+
+
 def load(path: Path, device: str = "cpu"):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = load_checkpoint(path, device)
     m = ckpt["meta"]
     model = build(m["arch"], m["encoder"], m["in_channels"], encoder_weights=None)
     model.load_state_dict(ckpt["state_dict"])

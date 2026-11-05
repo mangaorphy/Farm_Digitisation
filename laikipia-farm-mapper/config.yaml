@@ -92,7 +92,9 @@ model:
   encoder_weights: imagenet           # pretrained encoder; matters a lot with ~10k parcels
 
 train:
-  epochs: 40
+  epochs: 40                          # upper limit; with `patience` training stops earlier once it plateaus
+  patience: null                      # e.g. 15: stop after 15 epochs without a val mIoU gain > min_delta
+  min_delta: 0.002
   batch_size: 16                      # Kaggle T4/P100 (16 GB): 16 at 512 px
   lr: 0.0003
   weight_decay: 0.0001
