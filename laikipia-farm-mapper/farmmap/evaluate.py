@@ -1,110 +1,100 @@
-"""Honest evaluation on geographically held-out *test* blocks the model never saw.
+"""Score predicted farm polygons against your parcels, only inside held-out (test) map blocks.
 
-Reports (a) pixel IoU per class, (b) boundary precision/recall within a tolerance, and
-(c) polygon-level match against your manual polygons (IoU >= 0.5).
+A predicted farm matches a parcel when IoU >= evaluate.iou_match (one-to-one, best IoU first).
+Only predictions inside the labelled context count, because your file does not cover every farm:
+a "false positive" far from any mapped parcel may simply be an unmapped farm.
 """
 from __future__ import annotations
 
-import tempfile
+import json
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
-import rasterio
-from scipy import ndimage as ndi
-from shapely.geometry import box
-from shapely.ops import unary_union
+import pandas as pd
 
-from .data import block_window, load_or_create_split, split_blocks
-from .labels import IGNORE
-from .polygonize import polygonize_probs
-from .predict import predict_raster
-from .reference import load_reference
-from .train import confusion, iou_from_confusion
+from .labels import load_labels, matches
+from .tiles import blocks_gdf
+
+SIZE_BINS = [0, 0.5, 2, 10, np.inf]
+SIZE_NAMES = ["<0.5 ha", "0.5-2 ha", "2-10 ha", ">10 ha"]
 
 
-def _match(pred, ref, thr=0.5):
-    """Greedy one-to-one matching by IoU. Returns (n_matched, mean IoU of reference farms)."""
-    if len(pred) == 0 or len(ref) == 0:
-        return 0, 0.0
-    tree = pred.sindex
-    used, ious, matched = set(), [], 0
-    for g in ref.geometry:
-        best, best_j = 0.0, None
-        for j in tree.query(g, predicate="intersects"):
-            if j in used:
-                continue
-            p = pred.geometry.iloc[j]
-            iou = g.intersection(p).area / g.union(p).area
-            if iou > best:
-                best, best_j = iou, j
-        ious.append(best)
-        if best >= thr and best_j is not None:
-            used.add(best_j)
-            matched += 1
-    return matched, float(np.mean(ious))
+def match(pred: gpd.GeoDataFrame, ref: gpd.GeoDataFrame, thr: float) -> pd.DataFrame:
+    """Rows (ref_idx, pred_idx, iou) for every overlapping pair, plus a `matched` flag (greedy one-to-one)."""
+    if pred.empty or ref.empty:
+        return pd.DataFrame(columns=["ref", "pred", "iou", "matched"])
+    ri, pi = pred.sindex.query(ref.geometry, predicate="intersects")
+    a, b = ref.geometry.values[ri], pred.geometry.values[pi]
+    inter = a.intersection(b).area
+    iou = inter / (a.area + b.area - inter)
+    pairs = pd.DataFrame({"ref": ref.index.values[ri], "pred": pred.index.values[pi], "iou": iou,
+                          "ref_share": inter / a.area, "pred_share": inter / b.area})
+    pairs = pairs.sort_values("iou", ascending=False)
+    used_r, used_p, flag = set(), set(), []
+    for r, p, v in zip(pairs.ref, pairs.pred, pairs.iou):
+        ok = v >= thr and r not in used_r and p not in used_p
+        if ok:
+            used_r.add(r)
+            used_p.add(p)
+        flag.append(ok)
+    pairs["matched"] = flag
+    return pairs
 
 
-def evaluate(cfg, scenes=None, checkpoint=None, which="test", progress=print):
-    """Score a checkpoint on the held-out blocks of every scene. Pass the same `which` for every
-    model you want to compare."""
-    from .pipeline import list_scenes
+def evaluate(cfg, pred_path: Path, split: str = "test", out_dir: Path | None = None) -> dict:
+    out_dir = Path(out_dir or cfg.paths.outputs)
+    pred = gpd.read_file(pred_path).to_crs(cfg.aoi.crs)
+    labels = load_labels(cfg)
+    blocks = blocks_gdf(labels.total_bounds, cfg)
+    region = blocks[blocks.split == split].union_all() if split != "all" else blocks.union_all()
+    context = labels.geometry.buffer(float(cfg.labels.context_m)).union_all().intersection(region)
+    pred_extent = pred.union_all().convex_hull if len(pred) else None
 
-    scenes = scenes or list_scenes(cfg)
-    split = load_or_create_split(cfg, scenes, progress)
-    allb = split_blocks(split, which)
-    if not allb:
-        raise RuntimeError(f"No '{which}' blocks. The labelled area is too small to hold any out.")
-    cm = np.zeros((3, 3), np.int64)
-    tol = 2  # px
-    tp_p = n_p = tp_r = n_r = matched = n_pred = n_ref = 0
-    ious = []
-    for scene in scenes:
-        blocks = [b for b in allb if b["scene"] == scene["name"]]
-        if not blocks:
-            continue
-        regions = [block_window(b) for b in blocks]
-        with tempfile.TemporaryDirectory() as tmp:
-            probs_path = predict_raster(cfg, scene["imagery"], checkpoint, Path(tmp) / "probs.tif", regions,
-                                        lambda *_: None)
-            with rasterio.open(probs_path) as ps, rasterio.open(scene["labels"]) as ls:
-                crs, tr = ps.crs, ps.transform
-                for w in regions:
-                    pred = ps.read(window=w).argmax(0).astype(np.int64)
-                    lab = ls.read(1, window=w).astype(np.int64)
-                    cm += confusion(pred, lab)
-                    keep = lab != IGNORE
-                    pb, gb = (pred == 2) & keep, (lab == 2)
-                    if gb.any() and pb.any():
-                        near_g = ndi.distance_transform_edt(~gb) <= tol
-                        near_p = ndi.distance_transform_edt(~pb) <= tol
-                        tp_p += int((pb & near_g).sum()); n_p += int(pb.sum())
-                        tp_r += int((gb & near_p).sum()); n_r += int(gb.sum())
+    trusted = matches(labels, cfg.evaluate.get("reference")) if cfg.evaluate.get("reference") else labels.train
+    ref = labels[trusted & labels.representative_point().within(region)]
+    if pred_extent is not None:  # only parcels inside the area that was actually predicted
+        ref = ref[ref.within(pred_extent.buffer(1))]
+    p = pred[pred.representative_point().within(context)].reset_index(drop=True)
+    ref = ref.reset_index(drop=True)
+    # predictions that mostly cover a parcel outside the reference (QA-flagged, scheme layer...) are neither
+    # right nor wrong
+    ign = labels[~np.asarray(trusted)]
+    if len(ign) and len(p):
+        ii, pp = ign.sindex.query(p.geometry, predicate="intersects")
+        cover = pd.Series(p.geometry.values[ii].intersection(ign.geometry.values[pp]).area / p.area.values[ii]) \
+            .groupby(ii).sum()
+        p = p.drop(index=cover[cover > 0.5].index).reset_index(drop=True)
 
-            pred_poly = polygonize_probs(cfg, probs_path, progress=lambda *_: None)
-            region_geom = unary_union([box(*rasterio.windows.bounds(w, tr)) for w in regions])
-            ref = load_reference(cfg, crs=crs)
-            ref = ref[ref["ref_use"]]  # QA-flagged / filtered parcels are not scored
-            ref = ref.assign(geometry=ref.intersection(region_geom))
-            ref = ref[~ref.geometry.is_empty & (ref.area / 1e4 >= cfg.polygonize.min_area_ha)].reset_index(drop=True)
-            pred_poly = gpd.GeoDataFrame(geometry=pred_poly.geometry.intersection(region_geom), crs=crs)
-            pred_poly = pred_poly[~pred_poly.geometry.is_empty].reset_index(drop=True)
-            m, mean_iou = _match(pred_poly, ref)
-            matched += m; n_pred += len(pred_poly); n_ref += len(ref)
-            ious += [mean_iou] * len(ref)
+    pairs = match(p, ref, float(cfg.evaluate.iou_match))
+    tp = int(pairs.matched.sum()) if len(pairs) else 0
+    prec = tp / max(len(p), 1)
+    rec = tp / max(len(ref), 1)
+    best_iou = pairs.groupby("ref").iou.max().reindex(ref.index, fill_value=0) if len(pairs) else \
+        pd.Series(0.0, index=ref.index)
+    # over-segmentation: a parcel split into >1 predictions each covering >=20% of it; under: one prediction
+    # covering >=20% of several parcels (merged neighbours)
+    over = int((pairs[pairs.ref_share >= 0.2].groupby("ref").size() > 1).sum()) if len(pairs) else 0
+    under = int((pairs[pairs.pred_share >= 0.2].groupby("pred").size() > 1).sum()) if len(pairs) else 0
 
-    iou = iou_from_confusion(cm)
-    bp = tp_p / n_p if n_p else 0.0
-    br = tp_r / n_r if n_r else 0.0
-    fp = matched / n_pred if n_pred else 0.0
-    fr = matched / n_ref if n_ref else 0.0
-    return {
-        "split": which, "n_blocks": len(allb), "checkpoint": str(checkpoint or cfg.path(cfg.model.checkpoint)),
-        "iou_background": float(iou[0]), "iou_interior": float(iou[1]), "iou_boundary": float(iou[2]),
-        "boundary_precision": bp, "boundary_recall": br,
-        "boundary_f1": 2 * bp * br / (bp + br) if bp + br else 0.0,
-        "boundary_tolerance_m": tol * cfg.project.resolution_m,
-        "n_reference_farms": n_ref, "n_predicted_farms": n_pred, "matched_iou50": matched,
-        "farm_precision": fp, "farm_recall": fr, "farm_f1": 2 * fp * fr / (fp + fr) if fp + fr else 0.0,
-        "mean_best_iou_per_reference": float(np.mean(ious)) if ious else 0.0,
-    }
+    ref_area = ref.area / 1e4
+    ref_bin = pd.cut(ref_area, SIZE_BINS, labels=SIZE_NAMES)
+    matched_refs = set(pairs.loc[pairs.matched, "ref"]) if len(pairs) else set()
+    by_size = {str(k): {"parcels": int((ref_bin == k).sum()),
+                        "recall": round(float(np.mean([i in matched_refs for i in ref.index[ref_bin == k]]))
+                                        if (ref_bin == k).any() else float("nan"), 3)}
+               for k in SIZE_NAMES}
+    result = {"split": split, "predictions": len(p), "parcels": len(ref), "matched": tp,
+              "precision": round(prec, 3), "recall": round(rec, 3),
+              "f1": round(2 * prec * rec / max(prec + rec, 1e-9), 3),
+              "median_best_iou": round(float(best_iou.median()), 3) if len(best_iou) else None,
+              "over_segmented_parcels": over, "merged_predictions": under,
+              "recall_by_size": by_size, "iou_threshold": float(cfg.evaluate.iou_match),
+              "prediction_file": str(pred_path)}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(pred_path).stem
+    (out_dir / f"evaluation_{stem}_{split}.json").write_text(json.dumps(result, indent=2))
+    ref.assign(best_iou=best_iou.values, matched=[i in matched_refs for i in ref.index]).to_file(
+        out_dir / f"evaluation_{stem}_{split}.gpkg", layer="parcels", driver="GPKG")
+    print(json.dumps(result, indent=2))
+    return result

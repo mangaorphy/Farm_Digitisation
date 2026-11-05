@@ -1,265 +1,205 @@
-"""Offline tests on a synthetic scene. They verify the code path, not real-world accuracy."""
-import json
-import sys
-import zipfile
+"""Offline tests on a synthetic SDX-style scene. Run: pytest -q  (about 2-3 minutes on a laptop CPU)."""
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pytest
+import rasterio
+
+from farmmap import config, evaluate, imagery, labels, polygonize, predict, register, synthetic, tiles, train
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-from farmmap.config import load_config  # noqa: E402
-from farmmap.synthetic import demo_config, make_demo_data  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def demo(tmp_path_factory):
-    out = tmp_path_factory.mktemp("demo")
-    make_demo_data(out, size=1024, n_fields=14)
-    return demo_config(load_config(ROOT / "config.yaml"), out, epochs=3), out
+def work(tmp_path_factory):
+    d = tmp_path_factory.mktemp("farmmap")
+    raw, lab = synthetic.make_scene(d, size_m=500, n_fields=30, seed=1)
+    cfg = config.load(ROOT / "config.yaml", [
+        f"paths.imagery_raw={raw}", f"paths.labels={lab}", f"paths.scenes={d / 'scenes'}",
+        f"paths.mosaic={d / 'mosaic.vrt'}", f"paths.tiles={d / 'tiles'}", f"paths.models={d / 'models'}",
+        f"paths.outputs={d / 'out'}", f"paths.aoi={d / 'no_aoi.geojson'}", "aoi.bbox=null",
+        "tiles.size_px=128", "tiles.block_m=128", "train.batch_size=4", "train.num_workers=0", "model.encoder=resnet18", "model.encoder_weights=null",
+        "predict.tile_px=128", "predict.overlap_px=32", "predict.chunk_px=512",
+        "polygonize.block_px=512", "polygonize.halo_px=256"])
+    imagery.ingest(cfg)
+    return cfg
 
 
-def test_config_loads_and_county_boundary_is_valid():
-    from farmmap.county import load_county
-
-    cfg = load_config(ROOT / "config.yaml")
-    county = load_county(cfg)  # uses the shipped data/aoi/laikipia_county.geojson (downloads only if missing)
-    assert county.crs.to_string() == "EPSG:32637"
-    area_km2 = county.area.iloc[0] / 1e6
-    assert 8000 < area_km2 < 11000  # Laikipia County is ~9,500 km2
+def test_scene_pairing():
+    a = imagery._scene_key(Path("23JAN15081234-P1BS-0123_01_P001.TIF"))
+    b = imagery._scene_key(Path("23JAN15081234-M1BS-0123_01_P001.TIF"))
+    assert a == b
+    assert imagery._date_from_name(Path("23JAN15081234-P1BS-x.TIF")) == "20230115"
 
 
-def test_missing_reference_gives_helpful_error():
-    from farmmap.reference import load_reference
-
-    cfg = load_config(ROOT / "config.yaml")
-    cfg.reference.extra_dirs = ["data/labels/_does_not_exist"]
-    with pytest.raises(ValueError, match="data/labels/manual"):
-        load_reference(cfg)
-
-
-def test_estimate_skips_chunks_outside_county():
-    from farmmap.imagery import estimate
-
-    cfg = load_config(ROOT / "config.yaml")
-    cfg.imagery.bbox = None
-    est = estimate(cfg)
-    assert est["chunks_to_download"] <= est["chunks_total"] and 8000 < est["area_km2"] < 11000
+def test_ingest_pansharpens_to_grid(work):
+    with rasterio.open(work.paths.mosaic) as s:
+        assert s.count == 4 and abs(s.transform.a - 0.5) < 1e-9
+        assert s.transform.c % 0.5 == 0 and s.transform.f % 0.5 == 0  # grid aligned to pixel multiples
+        img = s.read()
+    assert (img > 0).mean() > 0.95
 
 
-def test_normalisation_keeps_nodata_zero():
-    from farmmap.data import to_model_input
-
-    norm = {"mean": [0.1, 0.2], "std": [0.05, 0.05], "red": 0, "nir": 1}
-    arr = np.zeros((2, 4, 4), np.uint16)
-    arr[:, 1:, 1:] = 2000
-    x = to_model_input(arr, norm)
-    assert x.shape == (3, 4, 4) and np.all(x[:, 0, :] == 0) and np.isfinite(x).all()
+def test_kmz_roundtrip_and_filters(work):
+    g = labels.load_labels(work)
+    assert len(g) > 20 and g.crs.to_epsg() == 32637
+    assert (~g.train).sum() == (g.QA_FLAG != "OK").sum()  # QA-flagged parcels are ignored, not dropped
 
 
-def test_labels_have_three_classes(demo):
-    import rasterio
-
-    from farmmap.labels import build_labels
-
-    cfg, out = demo
-    lab = build_labels(cfg, out / "demo_imagery.tif", progress=lambda *_: None)
-    with rasterio.open(lab) as s:
-        vals = set(np.unique(s.read(1)).tolist())
-    assert {0, 1, 2} <= vals or {1, 2} <= vals
+def test_tiles_masks(work):
+    idx = tiles.make_tiles(work)
+    assert set(idx.split) >= {"train", "val"} or len(idx) < 6
+    with rasterio.open(Path(work.paths.tiles) / "masks" / f"{idx.id[0]}.tif") as s:
+        m = s.read(1)
+    assert set(np.unique(m)) <= {0, 1, 2, 255} and (m == 1).any() and (m == 2).any()
 
 
-def test_train_predict_polygonize_export(demo):
-    from farmmap.evaluate import evaluate
-    from farmmap.pipeline import predict_area, prepare_training_data
-    from farmmap.train import train
+def test_registration_detects_shift(work):
+    base = labels.load_labels
 
-    cfg, out = demo
-    scenes = prepare_training_data(cfg, progress=lambda *_: None)
-    assert len(scenes) == 1
-    res = train(cfg, scenes, progress=lambda *_: None)
-    assert Path(res["checkpoint"]).exists() and res["history"]
+    def shifted(cfg, bbox="aoi", apply_shifts=True):
+        return labels.apply_label_shifts(base(cfg, bbox, False), "SOURCE", {"Scheme layer": [5, -3]})
 
-    # retraining from the saved checkpoint must work and keep the same split
-    split_before = json.loads(Path(cfg.split.file).read_text())["scenes"]
-    res2 = train(cfg, scenes, init_checkpoint=res["checkpoint"], epochs=1,
-                 out_checkpoint=out / "finetuned.pt", progress=lambda *_: None)
-    assert Path(res2["checkpoint"]).exists()
-    assert json.loads(Path(cfg.split.file).read_text())["scenes"] == split_before
-
-    metrics = evaluate(cfg, scenes, progress=lambda *_: None)
-    assert 0 <= metrics["iou_interior"] <= 1 and metrics["n_reference_farms"] >= 1
-
-    pred = predict_area(cfg, scenes[0]["imagery"], "demo", progress=lambda *_: None)
-    assert len(pred["frame"]) >= 1
-    assert pred["frame"].geometry.is_valid.all()
-    with zipfile.ZipFile(pred["kmz"]) as z:
-        assert b"<Polygon>" in z.read("doc.kml")
+    register.load_labels = shifted
+    try:
+        df = register.check(work, max_shift_m=12, per_group=30)
+    finally:
+        register.load_labels = base
+    row = df.set_index("group").loc["SOURCE=Scheme layer"]
+    assert row.verdict == "SHIFTED"
+    assert abs(row.best_dx_m + 5) <= 1 and abs(row.best_dy_m - 3) <= 1
+    assert df.set_index("group").loc["SOURCE=Digitized"].offset_m <= 1
 
 
-def test_kmz_roundtrips_as_reference(tmp_path, demo):
-    """A KMZ exported for Google Earth must be readable back as reference polygons."""
-    import geopandas as gpd
+def test_train_predict_polygonize_evaluate(work):
+    if not (Path(work.paths.tiles) / "index.csv").exists():
+        tiles.make_tiles(work)
+    best = train.train(work, epochs=2)
+    prob = predict.predict(work, best)
+    with rasterio.open(prob) as s:
+        assert s.count == 3
+    farms = polygonize.polygonize(work, prob)
+    assert isinstance(farms, gpd.GeoDataFrame)
+    res = evaluate.evaluate(work, Path(work.paths.outputs) / "farms.gpkg", split="all")
+    assert 0 <= res["precision"] <= 1 and res["parcels"] > 0
+
+
+def test_polygonize_blocks_consistent(tmp_path):
+    """Block-wise polygonize must give the same farms as one window."""
     from shapely.geometry import box
-
-    from farmmap.export import write_kmz
-    from farmmap.reference import read_vector
-
-    frame = gpd.GeoDataFrame({"farm_id": [1]}, geometry=[box(300000, 10000, 301000, 11000)], crs="EPSG:32637")
-    kmz = write_kmz(frame, tmp_path / "x.kmz")
-    back = read_vector(kmz)
-    assert len(back) == 1 and back.geometry.iloc[0].geom_type == "Polygon"
-
-
-KML = """<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
-<Folder><name>Existing farms</name>
- <Placemark><name>A</name><ExtendedData><SchemaData schemaUrl="#farms">
-   <SimpleData name="FARM_ID">LKP-1</SimpleData><SimpleData name="SOURCE">Digitized</SimpleData>
-   <SimpleData name="QA_FLAG">OK</SimpleData></SchemaData></ExtendedData>
-  <Polygon><outerBoundaryIs><LinearRing><coordinates>
-   36.60,0.10,0 36.61,0.10,0 36.61,0.11,0 36.60,0.11,0 36.60,0.10,0</coordinates></LinearRing></outerBoundaryIs>
-   <innerBoundaryIs><LinearRing><coordinates>
-   36.603,0.103,0 36.604,0.103,0 36.604,0.104,0 36.603,0.104,0 36.603,0.103,0</coordinates></LinearRing></innerBoundaryIs>
-  </Polygon></Placemark>
- <Placemark><name>B</name><ExtendedData><SchemaData schemaUrl="#farms">
-   <SimpleData name="FARM_ID">LKP-2</SimpleData><SimpleData name="SOURCE">Scheme layer</SimpleData>
-   <SimpleData name="QA_FLAG">OVERLAP</SimpleData></SchemaData></ExtendedData>
-  <Polygon><outerBoundaryIs><LinearRing><coordinates>
-   36.62,0.10,0 36.63,0.10,0 36.63,0.11,0 36.62,0.11,0 36.62,0.10,0</coordinates></LinearRing></outerBoundaryIs></Polygon>
- </Placemark>
-</Folder>
-<Folder><name>Fence</name><Placemark><name>f</name><LineString><coordinates>36.6,0.1,0 36.7,0.2,0</coordinates></LineString></Placemark></Folder>
-</Document></kml>"""
-
-
-def test_kml_with_attributes_holes_lines_and_qa_filter(tmp_path):
-    from farmmap.config import Cfg
-    from farmmap.reference import load_reference, read_vector
-
-    f = tmp_path / "farms.kml"
-    f.write_text(KML)
-    df = read_vector(f)
-    assert len(df) == 2 and list(df.FARM_ID) == ["LKP-1", "LKP-2"]  # the fence line is skipped
-    assert len(df.geometry.iloc[0].interiors) == 1  # hole preserved
-
-    cfg = Cfg({"project": {"crs": "EPSG:32637"},
-               "reference": {"polygons": [str(f)], "extra_dirs": [], "name_field": "FARM_ID",
-                             "filters": {"QA_FLAG": ["OK"]}}})
-    cfg.root = tmp_path
-    ref = load_reference(cfg)
-    assert len(ref) == 2 and list(ref.ref_use) == [True, False]  # flagged parcel kept but not used
-    assert list(ref.ref_name) == ["LKP-1", "LKP-2"]
-
-
-# ---------------------------------------------------------------- scoring + Delineate Anything wrapper
-
-
-def test_scorer_matches_and_stratifies_by_size():
-    import geopandas as gpd
-    from shapely.geometry import box
-
-    from farmmap.config import Cfg
-    from farmmap.scoring import Scorer
-
-    cfg = Cfg({"reference": {"coverage_buffer_m": 100}})
-    # reference: a 1.0 ha farm (100x100 m) and a 0.04 ha farm (20x20 m)
-    ref = gpd.GeoDataFrame({"ref_use": [True, True]}, crs="EPSG:32637",
-                           geometry=[box(0, 0, 100, 100), box(200, 0, 220, 20)])
-    pred = gpd.GeoDataFrame(crs="EPSG:32637", geometry=[box(5, 5, 100, 100),     # IoU ~0.9: found
-                                                        box(190, 0, 260, 60)])   # IoU ~0.1: not found
-    s = Scorer(cfg)
-    s.add(pred, ref, box(-50, -50, 400, 200))
-    out = s.summary()
-    assert out["n_reference"] == 2 and out["matched_iou50"] == 1
-    assert out["recall"] == 0.5 and out["precision"] == 0.5
-    assert out["recall_0-0.25ha"] == 0.0 and out["recall_1-4ha"] == 1.0
-
-
-def test_delineate_maps_pixel_polygons_to_map_coordinates(tmp_path):
-    """A stand-in detector returns a known pixel square; it must land at the right map position."""
-    import numpy as np
-    import rasterio
     from rasterio.transform import from_origin
-    from rasterio.windows import Window
+    from rasterio.features import rasterize
 
-    from farmmap.config import Cfg
-    from farmmap.delineate import delineate
-
-    tr = from_origin(250000, 30000, 10, 10)
-    p = tmp_path / "img.tif"
-    with rasterio.open(p, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint16",
-                       crs="EPSG:32637", transform=tr) as d:
-        d.write(np.random.default_rng(0).integers(500, 3000, (3, 256, 256), dtype=np.uint16))
-    cfg = Cfg({"project": {"crs": "EPSG:32637"},
-               "imagery": {"source": "local", "local_bands": ["R", "G", "B"]},
-               "polygonize": {"min_area_ha": 0.0},
-               "delineate": {"upsample": 1, "tile_px": 128, "overlap_px": 32, "imgsz": 640, "conf": 0.2,
-                             "iou": 0.5, "stretch_percentiles": [2, 98]}})
-    cfg.root = tmp_path
-    calls = []
-
-    def fake(img):  # always "finds" a square at pixels 40..60 of the padded tile
-        calls.append(img.shape)
-        return [(np.array([[40, 40], [60, 40], [60, 60], [40, 60]], float), 0.9)]
-
-    out = delineate(cfg, p, regions=[Window(0, 0, 128, 128)], predictor=fake, progress=lambda *_: None)
-    assert calls and calls[0] == (160, 160, 3)  # 128 core + 2*16 context pad (overlap_px=32)
-    # pad=16 => square at native px 24..44 (core-relative); its centre (34, 34) is inside the 128 core
-    assert len(out) == 1
-    minx, miny, maxx, maxy = out.geometry.iloc[0].bounds
-    assert abs(minx - (250000 + 24 * 10)) < 2 and abs(maxx - (250000 + 44 * 10)) < 2
-    assert abs(maxy - (30000 - 24 * 10)) < 2 and abs(miny - (30000 - 44 * 10)) < 2
-
-
-# ---------------------------------------------------------------- your own imagery (8-bit, alpha, lon/lat)
-
-
-def test_uint8_rgb_with_alpha_in_lonlat_is_prepared_and_accepted(tmp_path):
-    import numpy as np
-    import rasterio
-    from rasterio.transform import from_origin
-
-    from farmmap.data import imagery_problems, to_model_input
-    from farmmap.prepare import prepare_imagery
-    from farmmap.scale import to_unit
-
-    # 8-bit RGBA in geographic coordinates, like a drone orthomosaic exported from a photogrammetry tool
-    src = tmp_path / "ortho.tif"
     rng = np.random.default_rng(0)
-    data = rng.integers(20, 230, (4, 120, 120), dtype=np.uint8)
-    data[3] = 255  # alpha
-    with rasterio.open(src, "w", driver="GTiff", width=120, height=120, count=4, dtype="uint8",
-                       crs="EPSG:4326", transform=from_origin(36.70, 0.20, 0.00002, 0.00002)) as d:
-        d.write(data)
-    out = prepare_imagery(src, tmp_path / "ortho_utm.tif", crs="EPSG:32637", resolution=2.0, bands=[1, 2, 3],
-                          progress=lambda *_: None)
-    with rasterio.open(out) as r:
-        assert r.crs.to_string() == "EPSG:32637" and r.count == 3 and r.dtypes[0] == "uint8"
-        assert abs(r.transform.a - 2.0) < 1e-6
-        arr = r.read()
-    # 8-bit data must not be rejected as "constant" and must standardise to a sane range
-    refl = to_unit(arr)[:, (arr > 0).any(0)]
-    assert imagery_problems(refl, 1.0) == []
-    norm = {"mean": refl.mean(1).tolist(), "std": (refl.std(1) + 1e-6).tolist(), "red": None, "nir": None}
-    x = to_model_input(arr, norm)
-    assert np.isfinite(x).all() and abs(float(x[:, (arr > 0).any(0)].mean())) < 0.5
+    farms = [box(x, y, x + rng.uniform(20, 45), y + rng.uniform(20, 45))
+             for x in range(0, 400, 50) for y in range(0, 400, 50)]
+    t = from_origin(0, 400, 0.5, 0.5)
+    inside = rasterize([(f, 1) for f in farms], out_shape=(800, 800), transform=t).astype(bool)
+    edge = rasterize([(f.boundary.buffer(0.75), 1) for f in farms], out_shape=(800, 800), transform=t).astype(bool)
+    p_int = np.where(inside & ~edge, 0.95, 0.03)
+    p_bnd = np.where(edge, 0.9, 0.02)
+    bands = np.stack([1 - p_int - p_bnd, p_int, p_bnd]).clip(0, 1)
+    path = tmp_path / "prob.tif"
+    with rasterio.open(path, "w", driver="GTiff", width=800, height=800, count=3, dtype="uint8",
+                       crs="EPSG:32637", transform=t, nodata=0) as d:
+        d.write((bands * 254 + 1).astype(np.uint8))
+    out = {}
+    for b, h in [(4096, 0), (300, 128)]:
+        cfg = config.load(ROOT / "config.yaml", [f"paths.outputs={tmp_path}", f"polygonize.block_px={b}",
+                                                 f"polygonize.halo_px={h}"])
+        out[b] = polygonize.polygonize(cfg, path, tmp_path / f"f{b}.gpkg")
+    assert len(out[4096]) == len(farms)
+    m = evaluate.match(out[300], out[4096], 0.9)
+    assert m.matched.sum() == len(farms)
 
 
-def test_highres_config_is_complete_and_consistent():
-    from farmmap.delineate import rgb_positions
-    from farmmap.imagery import band_positions
-    from farmmap.pipeline import main_imagery
+def test_new_farm_defaults_and_cli_set(tmp_path):
+    """Polygons drawn in Earth Pro's "New farms" folder (no SOURCE/QA_FLAG) must become trainable parcels."""
+    from shapely.geometry import box
+    from farmmap.export import to_kmz
+    from farmmap import cli
 
-    cfg = load_config(ROOT / "config_highres.yaml")
-    assert cfg.imagery.source == "local" and main_imagery(cfg).name == "ortho.tif"
-    assert band_positions(cfg) == (None, None)          # RGB only: no NDVI channel
-    assert rgb_positions(cfg) == [0, 1, 2]
-    # nothing is shared with the Sentinel-2 project, so models/labels never mix
-    base = load_config(ROOT / "config.yaml")
-    for a, b in ((cfg.labels.dir, base.labels.dir), (cfg.model.checkpoint, base.model.checkpoint),
-                 (cfg.split.file, base.split.file), (cfg.imagery.dir, base.imagery.dir),
-                 (cfg.outputs.dir, base.outputs.dir)):
-        assert a != b
+    lab = tmp_path / "labels"
+    lab.mkdir()
+    to_kmz(gpd.GeoDataFrame({"farm_id": ["NEW-0001", "NEW-0002"]},
+                            geometry=[box(36.60, 0.10, 36.601, 0.101), box(36.602, 0.10, 36.603, 0.101)],
+                            crs="EPSG:4326"), lab / "new.kmz")
+    cfg = config.load(ROOT / "config.yaml", [f"paths.labels={lab}", f"paths.aoi={tmp_path / 'none.geojson'}"])
+    g = labels.load_labels(cfg)
+    assert len(g) == 2 and g.train.all() and set(g.SOURCE) == {"Digitized"}
+    # options after the command must not swallow it
+    cli.main(["labels", "--set", f"paths.labels={lab}", f"paths.aoi={tmp_path / 'none.geojson'}"])
+
+
+def _fake_context(cfg, path, layers=("crop_prob", "ndvi_h1")):
+    """A 10 m context file over the synthetic scene, as `farmmap context` would write it."""
+    from farmmap import context as CTX
+    from rasterio.transform import from_origin
+    with rasterio.open(cfg.paths.mosaic) as s:
+        L, B, R, T = s.bounds
+    gsd = 10.0
+    x0, y1 = np.floor(L / gsd) * gsd - 50, np.ceil(T / gsd) * gsd + 50
+    W, H = int((R - x0) / gsd) + 10, int((y1 - B) / gsd) + 10
+    yy, xx = np.mgrid[0:H, 0:W]
+    vals = {"crop_prob": 100.0 * xx / W, "ndvi_h1": np.full((H, W), 0.5)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(path, "w", driver="GTiff", width=W, height=H, count=len(layers), dtype="uint8", nodata=0,
+                       crs=cfg.aoi.crs, transform=from_origin(x0, y1, gsd, gsd)) as d:
+        d.write(np.stack([CTX.encode(vals[k], k) for k in layers]))
+        d.descriptions = tuple(f"ctx:dea:{k}" for k in layers)
+    return path
+
+
+def test_context_encode_read_roundtrip(work, tmp_path):
+    from farmmap import context as CTX
+    v = np.array([-0.2, 0.0, 0.45, 0.9, np.nan])
+    back = CTX.decode(CTX.encode(v, "ndvi_h1"), "ndvi_h1")
+    assert np.allclose(back[:4], v[:4], atol=0.005) and np.isnan(back[4])
+    f = _fake_context(work, tmp_path / "ctx" / "dea.tif")
+    with rasterio.open(work.paths.mosaic) as s:
+        t = s.transform
+    arr = CTX.read([f], work.aoi.crs, t, (64, 64))
+    assert arr.shape == (2, 64, 64) and (arr > 0).all()
+    assert abs(CTX.decode(arr[1], "ndvi_h1").mean() - 0.5) < 0.01
+
+
+def test_pipeline_with_context_bands(work, tmp_path):
+    """Context bands become extra chip channels, the model records them, predict re-attaches them,
+    and a different context.use is refused."""
+    from farmmap import config as C
+    _fake_context(work, tmp_path / "ctx" / "dea.tif")
+    cfg = C.Cfg(work)
+    cfg.paths = C.Cfg({**work.paths, "context": tmp_path / "ctx", "tiles": tmp_path / "tiles",
+                       "models": tmp_path / "models", "outputs": tmp_path / "out"})
+    cfg.context = C.Cfg({**work.context, "use": ["dea"]})
+    idx = tiles.make_tiles(cfg)
+    with rasterio.open(Path(cfg.paths.tiles) / "images" / f"{idx.id[0]}.tif") as s:
+        assert s.count == 6 and s.descriptions[4:] == ("ctx:dea:crop_prob", "ctx:dea:ndvi_h1")
+        assert (s.read()[4:] > 0).all()
+    best = train.train(cfg, epochs=1)
+    import torch
+    meta = torch.load(best, map_location="cpu")["meta"]
+    assert meta["in_channels"] == 6 and meta["image_bands"] == 4 and len(meta["context_bands"]) == 2
+    prob = predict.predict(cfg, best)
+    with rasterio.open(prob) as s:
+        assert s.count == 3 and (s.read(1) > 0).mean() > 0.9
+    # predict takes the context sources from the model, not from context.use
+    cfg.context = C.Cfg({**work.context, "use": []})
+    predict.predict(cfg, best, out_path=tmp_path / "p2.tif")
+    _fake_context(work, tmp_path / "ctx" / "dea.tif", layers=("crop_prob",))  # a different stack is refused
+    with pytest.raises(ValueError, match="context bands"):
+        predict.predict(cfg, best, out_path=tmp_path / "p3.tif")
+    _fake_context(work, tmp_path / "ctx" / "dea.tif")
+    # optional post-filter: crop_prob rises west->east, so a high minimum drops the western farms
+    cfg.polygonize = C.Cfg({**work.polygonize, "context_filter": {"band": "ctx:dea:crop_prob", "min": 50}})
+    farms = polygonize.polygonize(cfg, prob, tmp_path / "out" / "f.gpkg")
+    if len(farms):
+        assert (farms.ctx_value >= 50).all()
+
+
+def test_config_base_inheritance():
+    cfg = config.load(ROOT / "config_nicfi.yaml")
+    assert cfg.imagery.gsd_m == 4.77 and cfg.tiles.size_px == 256
+    assert cfg.labels.keep.QA_FLAG == ["OK"]          # inherited from config.yaml
+    assert cfg.paths.tiles.name == "tiles_nicfi" and cfg.paths.labels.name == "manual"

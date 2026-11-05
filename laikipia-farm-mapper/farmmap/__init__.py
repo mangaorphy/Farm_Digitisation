@@ -1,1 +1,2 @@
-"""Laikipia farm digitisation: Sentinel-2 -> U-Net -> farm polygons."""
+"""Laikipia farm digitisation: high-resolution imagery -> U-Net -> farm polygons."""
+__version__ = "2.0.0"

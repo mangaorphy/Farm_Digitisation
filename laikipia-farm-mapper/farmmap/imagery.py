@@ -1,199 +1,294 @@
-"""Cloud-free Sentinel-2 composites from the free Microsoft Planetary Computer STAC API.
+"""Turn raw SDX downloads (Vantor/Maxar-style GeoTIFF or NITF, PAN + MS or already pansharpened) into
+aligned 8-bit scenes on one UTM grid, plus a VRT mosaic.
 
-The output is one tiled GeoTIFF (uint16 reflectance x 10000, 0 = no data) on a fixed
-10 m UTM grid. Work is done in chunks and is resumable.
+Per scene, processed block by block so a 50k x 50k pixel file never has to fit in RAM:
+  1. warp to cfg.aoi.crs at cfg.imagery.gsd_m on a grid aligned to multiples of the pixel size
+     (files with only RPCs are orthorectified with a DEM or a constant height);
+  2. if a PAN file pairs with the MS file, ratio (Brovey) pansharpen with a per-scene PAN→intensity match;
+  3. keep R, G, B (+ NIR) and contrast-stretch each band to 1..255 with per-scene percentiles (0 = nodata).
 """
 from __future__ import annotations
 
 import json
 import math
-import warnings
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import numpy as np
 import rasterio
+from rasterio.enums import Resampling
 from rasterio.transform import from_origin
-from rasterio.warp import transform_bounds
+from rasterio.warp import reproject, transform_bounds
 from rasterio.windows import Window
 
-from .reference import read_vector
-
-STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
-# SCL classes treated as unusable: no data, saturated, cloud shadow, cloud (med/high), cirrus, snow
-SCL_BAD = (0, 1, 3, 8, 9, 10, 11)
-BOA_OFFSET = 1000  # processing baseline >= 04.00 (all scenes since 2022-01-25)
+RASTER_EXT = {".tif", ".tiff", ".ntf", ".nitf", ".jp2", ".img"}
+PAN_TOKENS = ("P1BS", "-P", "_P", "PAN")
+MS_TOKENS = ("M1BS", "-M", "_M", "MUL", "MS")
+BLOCK = 2048
 
 
-def chunk_windows(width: int, height: int, size: int):
-    for row in range(0, height, size):
-        for col in range(0, width, size):
-            yield Window(col, row, min(size, width - col), min(size, height - row))
+@dataclass
+class Scene:
+    id: str
+    ms: Path | None = None
+    pan: Path | None = None
+    date: str = ""
+    notes: list[str] = field(default_factory=list)
 
 
-def grid_for_bounds(bounds, res: float):
-    """Grid snapped to multiples of `res` so rasters from different runs line up."""
-    minx, miny, maxx, maxy = bounds
-    x0 = math.floor(minx / res) * res
-    y1 = math.ceil(maxy / res) * res
-    return from_origin(x0, y1, res, res), math.ceil((maxx - x0) / res), math.ceil((y1 - miny) / res)
+def _georef(src) -> dict:
+    """Kwargs for reproject(): a CRS+transform, or RPCs for un-orthorectified products."""
+    if src.crs is not None and not src.transform.is_identity:
+        return {"src_crs": src.crs, "src_transform": src.transform}
+    if src.rpcs is not None:
+        return {"rpcs": src.rpcs}
+    if src.gcps[0]:
+        return {"gcps": src.gcps[0], "src_crs": src.gcps[1]}
+    raise ValueError(f"{src.name}: no CRS, RPCs or GCPs - cannot place it on the map")
 
 
-def aoi_geometry(cfg, aoi_path=None, bbox=None):
-    """Shapely geometry (project CRS) of the area to cover: bbox arg > aoi file > config bbox > county."""
-    from shapely.geometry import box
-
-    from .county import load_county
-
-    crs = cfg.project.crs
-    bbox = bbox or (None if aoi_path else cfg.imagery.get("bbox"))
-    if bbox:
-        return box(*transform_bounds("EPSG:4326", crs, *bbox, densify_pts=21))
-    if aoi_path:
-        df = read_vector(aoi_path)
-        df = df.set_crs("EPSG:4326") if df.crs is None else df
-        return df.to_crs(crs).geometry.union_all()
-    return load_county(cfg, crs).geometry.iloc[0]
+def _scene_key(path: Path) -> str:
+    """Pair PAN/MS files: Maxar names differ only in P1BS/M1BS (or -P/-M) tokens."""
+    stem = path.stem.upper()
+    stem = re.sub(r"(P1BS|M1BS|PAN|MUL)", "X", stem)
+    stem = re.sub(r"(?<=[-_])[PM](?=[-_.]|$)", "X", stem)
+    return stem
 
 
-def aoi_bounds(cfg, aoi_path=None, bbox=None):
-    return aoi_geometry(cfg, aoi_path, bbox).bounds
+def _date_from_name(path: Path) -> str:
+    m = re.search(r"(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)", path.name)
+    if m:
+        return "".join(m.groups())
+    m = re.search(r"(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})", path.name.upper())
+    if m:  # Maxar catalog style, e.g. 23JAN15 = 2023-01-15
+        return datetime.strptime(m.group(0), "%y%b%d").strftime("%Y%m%d")
+    return ""
 
 
-def band_positions(cfg):
-    """(red_idx, nir_idx) positions in the raster, or (None, None) if unknown."""
-    names = cfg.imagery.bands if cfg.imagery.source == "planetary_computer" else cfg.imagery.get("local_bands")
-    if not names:
-        return None, None
-    names = [str(n).upper() for n in names]
-    for red, nir in (("B04", "B08"), ("R", "NIR"), ("RED", "NIR")):
-        if red in names and nir in names:
-            return names.index(red), names.index(nir)
-    return None, None
+def discover(raw_dir: Path) -> list[Scene]:
+    """Group raster files into scenes (MS with optional PAN). Single-band files without a partner are skipped."""
+    files = sorted(p for p in Path(raw_dir).rglob("*") if p.suffix.lower() in RASTER_EXT and p.is_file())
+    groups: dict[str, Scene] = {}
+    for f in files:
+        try:
+            with rasterio.open(f) as src:
+                count = src.count
+        except Exception as e:  # noqa: BLE001 - report and carry on with other files
+            print(f"  skip {f.name}: {e}")
+            continue
+        key = _scene_key(f)
+        sc = groups.setdefault(key, Scene(id=re.sub(r"[^A-Za-z0-9_-]+", "_", key)[:80], date=_date_from_name(f)))
+        if count == 1:
+            sc.pan = f
+        elif sc.ms is None:
+            sc.ms = f
+        else:
+            sc.notes.append(f"extra multiband file ignored: {f.name}")
+    scenes = []
+    for sc in groups.values():
+        if sc.ms is None:
+            print(f"  skip {sc.id}: PAN only (no multispectral partner)")
+            continue
+        scenes.append(sc)
+    return scenes
 
 
-def estimate(cfg, aoi_path=None, bbox=None):
-    """Grid size and the number of chunks that actually intersect the area."""
-    from shapely.geometry import box
+def band_indices(src, cfg) -> dict[str, int]:
+    """1-based band numbers for R, G, B (and N) in a multispectral file."""
+    names = ["R", "G", "B", "N"]
+    if cfg.imagery.bands != "auto":
+        return dict(zip(names, cfg.imagery.bands))
+    desc = [(d or "").lower() for d in src.descriptions]
+    found = {}
+    for i, d in enumerate(desc, start=1):
+        if "red" in d and "edge" not in d and "R" not in found:
+            found["R"] = i
+        elif "green" in d:
+            found.setdefault("G", i)
+        elif "blue" in d:
+            found.setdefault("B", i)
+        elif ("nir" in d or "near" in d) and "N" not in found:
+            found["N"] = i
+    if {"R", "G", "B"} <= found.keys():
+        return found
+    # band-count conventions: WorldView/Legion 8-band, 4-band BGRN, 3-band RGB
+    return {8: {"R": 5, "G": 3, "B": 2, "N": 7},
+            4: {"R": 3, "G": 2, "B": 1, "N": 4},
+            3: {"R": 1, "G": 2, "B": 3}}.get(src.count) or _fail(src)
 
-    aoi = aoi_geometry(cfg, aoi_path, bbox)
-    transform, w, h = grid_for_bounds(aoi.bounds, cfg.project.resolution_m)
-    wins = list(chunk_windows(w, h, cfg.imagery.chunk_px))
-    needed = sum(aoi.intersects(box(*rasterio.windows.bounds(x, transform))) for x in wins)
-    return {"width_px": w, "height_px": h, "chunks_total": len(wins), "chunks_to_download": int(needed),
-            "area_km2": round(aoi.area / 1e6)}
+
+def _fail(src):
+    raise ValueError(f"{src.name}: {src.count} bands with no descriptions - set imagery.bands in config.yaml")
 
 
-def _chunk_composite(catalog, cfg, window_bounds, shape, transform, crs):
-    """Median composite of the least-cloudy scenes for one chunk -> (bands, h, w) uint16 or None."""
-    import odc.stac
-    from odc.geo.geobox import GeoBox
+def target_grid(src, cfg) -> tuple[rasterio.Affine, int, int]:
+    """Output grid in cfg.aoi.crs covering the file ∩ AOI, aligned to multiples of gsd."""
+    gsd = float(cfg.imagery.gsd_m)
+    if "rpcs" in _georef(src):
+        lons = [src.rpcs.long_off - src.rpcs.long_scale, src.rpcs.long_off + src.rpcs.long_scale]
+        lats = [src.rpcs.lat_off - src.rpcs.lat_scale, src.rpcs.lat_off + src.rpcs.lat_scale]
+        b = transform_bounds("EPSG:4326", cfg.aoi.crs, min(lons), min(lats), max(lons), max(lats))
+    else:
+        b = transform_bounds(src.crs, cfg.aoi.crs, *src.bounds)
+    from .labels import aoi_bbox
+    if aoi_bbox(cfg):
+        a = transform_bounds("EPSG:4326", cfg.aoi.crs, *aoi_bbox(cfg))
+        b = (max(b[0], a[0]), max(b[1], a[1]), min(b[2], a[2]), min(b[3], a[3]))
+    if b[2] <= b[0] or b[3] <= b[1]:
+        raise ValueError("scene does not overlap the AOI")
+    x0, y1 = math.floor(b[0] / gsd) * gsd, math.ceil(b[3] / gsd) * gsd
+    x1, y0 = math.ceil(b[2] / gsd) * gsd, math.floor(b[1] / gsd) * gsd
+    return from_origin(x0, y1, gsd, gsd), int(round((x1 - x0) / gsd)), int(round((y1 - y0) / gsd))
 
-    ic = cfg.imagery
-    lonlat = transform_bounds(crs, "EPSG:4326", *window_bounds, densify_pts=11)
-    items = list(
-        catalog.search(
-            collections=[ic.collection],
-            bbox=lonlat,
-            datetime=f"{ic.date_range[0]}/{ic.date_range[1]}",
-            query={"eo:cloud_cover": {"lt": ic.max_cloud_cover}},
-        ).items()
-    )
-    if not items:
-        return None
-    by_tile: dict[str, list] = {}
-    for it in items:
-        by_tile.setdefault(it.properties.get("s2:mgrs_tile", it.id[:12]), []).append(it)
-    chosen = []
-    for group in by_tile.values():
-        group.sort(key=lambda i: i.properties.get("eo:cloud_cover", 100))
-        chosen += group[: ic.max_scenes_per_tile]
 
-    geobox = GeoBox(shape, transform, crs)
-    ds = odc.stac.load(
-        chosen,
-        bands=[*ic.bands, "SCL"],
-        geobox=geobox,
-        resampling={"SCL": "nearest", "*": "bilinear"},
-        groupby="solar_day",
-    )
-    bad = np.isin(ds["SCL"].values, SCL_BAD)
-    layers = []
-    any_valid = np.zeros(shape, bool)
-    for b in ic.bands:
-        raw = ds[b].values
-        if np.issubdtype(raw.dtype, np.integer):  # raw digital numbers: apply BOA offset
-            refl = (raw.astype(np.float32) - BOA_OFFSET) / 10000.0
-            invalid = raw == 0
-        else:  # odc-stac already scaled to reflectance
-            refl = raw.astype(np.float32)
-            invalid = ~np.isfinite(refl)
-        refl[bad | invalid] = np.nan
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            med = np.nanmedian(refl, axis=0)
-        valid = np.isfinite(med)
-        any_valid |= valid
-        layers.append(np.where(valid, np.clip(med, 0, 1), 0.0))
-    out = np.maximum(np.round(np.stack(layers) * 10000), 1).astype(np.uint16)  # 0 is reserved for nodata
-    out[:, ~any_valid] = 0
+def _warp(src, bands, transform, shape, cfg, resampling) -> np.ndarray:
+    out = np.zeros((len(bands), *shape), dtype=np.float32)
+    nodata = src.nodata if src.nodata is not None else 0
+    extra = {}
+    if "rpcs" in _georef(src):
+        extra = {"RPC_DEM": str(cfg.imagery.dem)} if cfg.imagery.get("dem") else {"RPC_HEIGHT": cfg.imagery.rpc_height_m}
+    for k, b in enumerate(bands):
+        reproject(rasterio.band(src, b), out[k], dst_transform=transform, dst_crs=cfg.aoi.crs,
+                  src_nodata=nodata, dst_nodata=0, resampling=resampling, num_threads=4, **_georef(src), **extra)
     return out
 
 
-def fetch_composite(cfg, out_path=None, aoi_path=None, bbox=None, progress=print):
-    """Download/compose imagery for the AOI. Resumes if interrupted. Returns the GeoTIFF path."""
-    import planetary_computer
-    import pystac_client
+def _sample(src, bands, max_px=1500) -> np.ndarray:
+    """Decimated read for statistics (no georeferencing needed)."""
+    f = max(1, int(max(src.width, src.height) / max_px))
+    arr = src.read(bands, out_shape=(len(bands), src.height // f, src.width // f),
+                   resampling=Resampling.average).astype(np.float32)
+    nodata = src.nodata if src.nodata is not None else 0
+    arr[arr == nodata] = np.nan
+    return arr
 
-    ic = cfg.imagery
-    out_path = Path(out_path) if out_path else cfg.path(ic.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    crs, res = cfg.project.crs, cfg.project.resolution_m
-    from shapely.geometry import box
 
-    aoi = aoi_geometry(cfg, aoi_path, bbox)
-    transform, width, height = grid_for_bounds(aoi.bounds, res)
-    nb = len(ic.bands)
-    state_file = out_path.with_suffix(".progress.json")
+def ingest_scene(sc: Scene, cfg, out_dir: Path) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{sc.id}.tif"
+    with rasterio.open(sc.ms) as ms:
+        idx = band_indices(ms, cfg)
+        names = ["R", "G", "B"] + (["N"] if cfg.imagery.use_nir and "N" in idx else [])
+        bands = [idx[n] for n in names]
+        transform, width, height = target_grid(ms, cfg)
 
-    done: set[int] = set()
-    if out_path.exists() and state_file.exists():
-        done = set(json.loads(state_file.read_text())["done"])
-        mode = "r+"
-    else:
-        mode = "w"
-    kwargs = {}
-    if mode == "w":
-        kwargs = dict(driver="GTiff", width=width, height=height, count=nb, dtype="uint16", crs=crs,
-                      transform=transform, nodata=0, tiled=True, blockxsize=256, blockysize=256,
-                      compress="deflate", predictor=2, BIGTIFF="IF_SAFER")
+        stats = _sample(ms, bands)
+        lo_p, hi_p = cfg.imagery.stretch_percentiles
+        lo = np.nanpercentile(stats.reshape(len(bands), -1), lo_p, axis=1)
+        hi = np.nanpercentile(stats.reshape(len(bands), -1), hi_p, axis=1)
 
-    catalog = pystac_client.Client.open(STAC_URL, modifier=planetary_computer.sign_inplace)
-    wins = list(chunk_windows(width, height, ic.chunk_px))
-    progress(f"Composite grid {width}x{height}px, {len(wins)} chunks ({len(done)} already done)")
-    with rasterio.open(out_path, mode, **kwargs) as dst:
-        if mode == "w":
-            dst.update_tags(bands=",".join(ic.bands), source=ic.collection,
-                            date_range=f"{ic.date_range[0]}/{ic.date_range[1]}", scale="reflectance*10000")
-        for i, win in enumerate(wins):
-            if i in done:
-                continue
-            wb = rasterio.windows.bounds(win, transform)
-            wt = rasterio.windows.transform(win, transform)
-            if not aoi.intersects(box(*wb)):  # chunk lies entirely outside the area: nothing to download
-                done.add(i)
-                continue
-            try:
-                arr = _chunk_composite(catalog, cfg, wb, (int(win.height), int(win.width)), wt, crs)
-            except Exception as exc:  # network hiccup: leave chunk for the next resume
-                progress(f"  chunk {i + 1}/{len(wins)} failed ({type(exc).__name__}: {exc}); will retry on resume")
-                continue
-            if arr is not None:
-                dst.write(arr, window=win)
-            done.add(i)
-            state_file.write_text(json.dumps({"done": sorted(done)}))
-            progress(f"  chunk {i + 1}/{len(wins)} {'written' if arr is not None else 'no scenes'}")
-    if len(done) == len(wins):
-        state_file.unlink(missing_ok=True)
-    else:
-        progress(f"{len(wins) - len(done)} chunk(s) incomplete: rerun fetch to resume.")
-    return out_path
+        pan = rasterio.open(sc.pan) if (sc.pan and cfg.imagery.pansharpen in ("auto", True)) else None
+        if pan is not None:
+            ps = _sample(pan, [1])[0]
+            intensity = np.nanmean(stats[:3], axis=0)
+            # PAN and MS DNs are on different scales: match PAN mean/std to MS intensity (per scene, no seams)
+            gain = np.nanstd(intensity) / max(np.nanstd(ps), 1e-6)
+            offset = np.nanmean(intensity) - gain * np.nanmean(ps)
+
+        profile = dict(driver="GTiff", width=width, height=height, count=len(bands), dtype="uint8", nodata=0,
+                       crs=cfg.aoi.crs, transform=transform, tiled=True, blockxsize=512, blockysize=512,
+                       compress="deflate", predictor=2, BIGTIFF="IF_SAFER")
+        valid_px = 0
+        with rasterio.open(out_path, "w", **profile) as dst:
+            for r in range(0, height, BLOCK):
+                for c in range(0, width, BLOCK):
+                    win = Window(c, r, min(BLOCK, width - c), min(BLOCK, height - r))
+                    wt = rasterio.windows.transform(win, transform)
+                    shape = (int(win.height), int(win.width))
+                    arr = _warp(ms, bands, wt, shape, cfg, Resampling.bilinear)
+                    valid = (arr > 0).all(axis=0)
+                    if pan is not None and valid.any():
+                        p = _warp(pan, [1], wt, shape, cfg, Resampling.average)[0]
+                        valid &= p > 0
+                        inten = arr[:3].mean(axis=0)
+                        ratio = np.where(inten > 0, (gain * p + offset) / np.maximum(inten, 1e-6), 1.0)
+                        arr *= np.clip(ratio, 0.2, 5.0)[None]
+                    if not valid.any():
+                        continue
+                    scaled = (arr - lo[:, None, None]) / np.maximum(hi - lo, 1e-6)[:, None, None]
+                    out = np.clip(np.round(1 + scaled * 254), 1, 255).astype(np.uint8)
+                    out[:, ~valid] = 0
+                    dst.write(out, window=win)
+                    valid_px += int(valid.sum())
+            dst.descriptions = tuple(names)
+            dst.update_tags(source_ms=sc.ms.name, source_pan=sc.pan.name if pan is not None else "",
+                            pansharpened=str(pan is not None), date=sc.date, gsd_m=str(cfg.imagery.gsd_m))
+        if pan is not None:
+            pan.close()
+    if valid_px == 0:
+        out_path.unlink(missing_ok=True)
+        raise ValueError("no valid pixels inside the AOI")
+    return {"id": sc.id, "path": str(out_path), "date": sc.date, "bands": names, "pansharpened": pan is not None,
+            "valid_km2": round(valid_px * float(cfg.imagery.gsd_m) ** 2 / 1e6, 2),
+            "ms": str(sc.ms), "pan": str(sc.pan) if sc.pan else None, "notes": sc.notes}
+
+
+def write_vrt(scene_paths: list[Path], vrt_path: Path) -> Path:
+    """Stitch aligned scenes into one VRT; later entries are drawn on top (nodata 0 is transparent)."""
+    metas = []
+    for p in scene_paths:
+        with rasterio.open(p) as s:
+            metas.append((p, s.transform, s.width, s.height, s.count, s.crs, s.descriptions))
+    counts = {m[4] for m in metas}
+    if len(counts) != 1:
+        raise ValueError(f"scenes have different band counts {counts}; set imagery.use_nir consistently")
+    gsd = metas[0][1].a
+    x0 = min(m[1].c for m in metas)
+    y1 = max(m[1].f for m in metas)
+    x1 = max(m[1].c + m[2] * gsd for m in metas)
+    y0 = min(m[1].f - m[3] * gsd for m in metas)
+    W, H = int(round((x1 - x0) / gsd)), int(round((y1 - y0) / gsd))
+    n = metas[0][4]
+    lines = [f'<VRTDataset rasterXSize="{W}" rasterYSize="{H}">',
+             f"  <SRS>{escape(metas[0][5].to_wkt())}</SRS>",
+             f"  <GeoTransform>{x0}, {gsd}, 0, {y1}, 0, {-gsd}</GeoTransform>"]
+    for b in range(1, n + 1):
+        lines.append(f'  <VRTRasterBand dataType="Byte" band="{b}">')
+        lines.append("    <NoDataValue>0</NoDataValue>")
+        lines.append(f"    <Description>{escape(metas[0][6][b - 1] or '')}</Description>")
+        for p, t, w, h, *_ in metas:
+            xoff, yoff = int(round((t.c - x0) / gsd)), int(round((y1 - t.f) / gsd))
+            rel = Path(p).resolve()
+            lines += ["    <ComplexSource>",
+                      f'      <SourceFilename relativeToVRT="0">{escape(str(rel))}</SourceFilename>',
+                      f"      <SourceBand>{b}</SourceBand>",
+                      f'      <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>',
+                      f'      <DstRect xOff="{xoff}" yOff="{yoff}" xSize="{w}" ySize="{h}"/>',
+                      "      <NODATA>0</NODATA>",
+                      "    </ComplexSource>"]
+        lines.append("  </VRTRasterBand>")
+    lines.append("</VRTDataset>")
+    vrt_path.parent.mkdir(parents=True, exist_ok=True)
+    vrt_path.write_text("\n".join(lines))
+    return vrt_path
+
+
+def ingest(cfg, only: list[str] | None = None) -> list[dict]:
+    raw, out_dir = Path(cfg.paths.imagery_raw), Path(cfg.paths.scenes)
+    scenes = discover(raw)
+    if only:
+        scenes = [s for s in scenes if s.id in only]
+    if not scenes:
+        raise FileNotFoundError(f"No usable imagery in {raw}. Copy the SDX downloads there (any sub-folders).")
+    print(f"{len(scenes)} scene(s) found in {raw}")
+    index_path = out_dir / "scenes.json"
+    done = {d["id"]: d for d in json.loads(index_path.read_text())} if index_path.exists() else {}
+    for sc in scenes:
+        if sc.id in done and Path(done[sc.id]["path"]).exists():
+            print(f"  {sc.id}: already ingested")
+            continue
+        print(f"  {sc.id}: MS={sc.ms.name} PAN={sc.pan.name if sc.pan else '-'}")
+        try:
+            done[sc.id] = ingest_scene(sc, cfg, out_dir)
+            print(f"    -> {done[sc.id]['valid_km2']} km² inside AOI")
+        except ValueError as e:
+            print(f"    skipped: {e}")
+    rows = sorted(done.values(), key=lambda d: d["date"], reverse=not cfg.imagery.newest_on_top)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(json.dumps(rows, indent=2))
+    write_vrt([Path(r["path"]) for r in rows], Path(cfg.paths.mosaic))
+    print(f"Mosaic: {cfg.paths.mosaic} ({len(rows)} scene(s), newest on top={cfg.imagery.newest_on_top})")
+    return rows

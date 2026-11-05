@@ -1,0 +1,35 @@
+# Planet NICFI monthly basemaps (~4.77 m, via Google Earth Engine) as the main image instead of Legion.
+# Only the settings that differ from config.yaml are here. Use with --config config_nicfi.yaml, e.g.
+#   python -m farmmap nicfi --month 2025-06 --config config_nicfi.yaml
+#   python -m farmmap ingest --config config_nicfi.yaml
+#   python -m farmmap tiles  --config config_nicfi.yaml
+# NICFI needs a (free) sign-up with Planet's NICFI programme and is licensed for non-commercial use only.
+base: config.yaml
+
+paths:
+  imagery_raw: data/imagery/raw_nicfi
+  scenes: data/imagery/scenes_nicfi
+  mosaic: data/imagery/mosaic_nicfi.vrt
+  tiles: data/tiles_nicfi
+  models: data/models_nicfi
+  outputs: outputs/nicfi
+
+imagery:
+  gsd_m: 4.77                         # native NICFI pixel at the equator
+  bands: auto                         # the export writes blue, green, red, nir band names
+  pansharpen: false
+
+tiles:
+  size_px: 256                        # 1.2 km chips
+  boundary_width_m: 5                 # about one pixel: a 1.5 m line would vanish at 4.77 m
+  block_m: 2000
+
+predict:
+  tile_px: 256
+  overlap_px: 64
+  chunk_px: 2048
+
+polygonize:
+  simplify_m: 2.5
+  block_px: 2048
+  halo_px: 256

@@ -1,63 +1,105 @@
-"""Sliding-window inference -> 3-band uint8 probability GeoTIFF (P*255 for bg / interior / boundary)."""
+"""Run the model over a raster (the mosaic or one scene) and write class probabilities as a 3-band uint8 GeoTIFF
+(0-255 = 0-100 %; bands: background, interior, boundary). Works in chunks, so any area fits in RAM.
+"""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
 import rasterio
-from rasterio.windows import Window
+import torch
+from rasterio.windows import Window, from_bounds
+from tqdm import tqdm
 
-from .data import to_model_input
-from .imagery import chunk_windows
-from .model import load_checkpoint, pick_device
-
-
-def _tiles_in(region: Window, size: int):
-    for w in chunk_windows(int(region.width), int(region.height), size):
-        yield Window(region.col_off + w.col_off, region.row_off + w.row_off, w.width, w.height)
+from . import context as CTX
+from . import model as M
 
 
-def predict_raster(cfg, imagery_path, checkpoint=None, out_path=None, regions=None, progress=print):
-    """Predict class probabilities. `regions` = list of Windows to restrict to (e.g. test blocks);
-    everything else stays 0. Returns the output path."""
-    import torch
+def _weights(n: int) -> np.ndarray:
+    """2D blending window: down-weights chip edges where the model has less context."""
+    w = np.hanning(n + 2)[1:-1]
+    return np.maximum(np.outer(w, w), 1e-3).astype(np.float32)
 
+
+def _infer_chunk(net, img: np.ndarray, tile: int, overlap: int, batch: int, dev: str, n_image: int) -> np.ndarray:
+    C, H, W = img.shape
+    step = tile - overlap
+    ys = list(range(0, max(H - tile, 0) + 1, step)) or [0]
+    xs = list(range(0, max(W - tile, 0) + 1, step)) or [0]
+    if ys[-1] + tile < H:
+        ys.append(H - tile)
+    if xs[-1] + tile < W:
+        xs.append(W - tile)
+    acc = np.zeros((3, H, W), np.float32)
+    wsum = np.zeros((H, W), np.float32)
+    wt = _weights(tile)
+    coords = [(y, x) for y in ys for x in xs if (img[:n_image, y:y + tile, x:x + tile] > 0).any()]
+    for i in range(0, len(coords), batch):
+        part = coords[i:i + batch]
+        x = np.stack([M.normalize(img[:, y:y + tile, x:x + tile]) for y, x in part])
+        with torch.no_grad():
+            p = net(torch.from_numpy(x).to(dev)).softmax(1).float().cpu().numpy()
+        for (y, x0), pk in zip(part, p):
+            acc[:, y:y + tile, x0:x0 + tile] += pk * wt
+            wsum[y:y + tile, x0:x0 + tile] += wt
+    return acc / np.maximum(wsum, 1e-6)
+
+
+def predict(cfg, model_path: Path, raster: Path | None = None, out_path: Path | None = None,
+            bounds: tuple | None = None) -> Path:
+    raster = Path(raster or cfg.paths.mosaic)
+    out_path = Path(out_path or Path(cfg.paths.outputs) / "probabilities.tif")
+    dev = M.device()
+    if dev == "cpu":
+        torch.set_num_threads(max(1, torch.get_num_threads()))
+    net, meta = M.load(model_path, dev)
     pc = cfg.predict
-    checkpoint = checkpoint or cfg.path(cfg.model.checkpoint)
-    device = pick_device(cfg.train.device)
-    model, norm, _ = load_checkpoint(checkpoint, device)
-    imagery_path = Path(imagery_path)
-    out_path = Path(out_path) if out_path else cfg.path(cfg.outputs.dir) / (imagery_path.stem + "_probs.tif")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with rasterio.open(imagery_path) as src:
-        profile = dict(driver="GTiff", width=src.width, height=src.height, count=3, dtype="uint8",
-                       crs=src.crs, transform=src.transform, tiled=True, blockxsize=256, blockysize=256,
-                       compress="deflate", BIGTIFF="IF_SAFER")
+    tile, overlap, chunk = int(pc.tile_px), int(pc.overlap_px), int(pc.chunk_px)
+    halo = overlap
+    # context layers: the same sources the model was trained with (recorded in the checkpoint), from paths.context
+    want_ctx = list(meta.get("context_bands", []))
+    ctx_files = [Path(cfg.paths.context) / f"{s}.tif" for s in dict.fromkeys(b.split(":")[1] for b in want_ctx)]
+    missing = [str(f) for f in ctx_files if not f.exists()]
+    if missing:
+        raise FileNotFoundError(f"model needs context layers {missing}: run `python -m farmmap context` "
+                                "or point paths.context at them")
+    if CTX.band_names(ctx_files) != want_ctx:
+        raise ValueError(f"model was trained with context bands {want_ctx}, but {ctx_files} hold "
+                         f"{CTX.band_names(ctx_files)}: rebuild them with the training settings")
+    with rasterio.open(raster) as src:
+        n_image = src.count
+        if abs(src.transform.a - meta["gsd_m"]) > 0.05 * meta["gsd_m"]:
+            print(f"WARNING: raster pixel {src.transform.a} m but model trained at {meta['gsd_m']} m")
+        if n_image + len(want_ctx) != meta["in_channels"]:
+            raise ValueError(f"raster has {n_image} bands (+{len(want_ctx)} context), model expects "
+                             f"{meta['in_channels']} {meta['bands']}")
         full = Window(0, 0, src.width, src.height)
-        regions = regions or [full]
-        tiles = [t for r in regions for t in _tiles_in(r, pc.tile_px)]
-        pad = pc.pad_px
+        if bounds is not None:
+            full = from_bounds(*bounds, src.transform).round_offsets().round_lengths().intersection(full)
+        c0, r0 = int(full.col_off), int(full.row_off)
+        W, H = int(full.width), int(full.height)
+        profile = dict(driver="GTiff", width=W, height=H, count=3, dtype="uint8", crs=src.crs,
+                       transform=src.window_transform(full), tiled=True, blockxsize=512, blockysize=512,
+                       compress="deflate", nodata=0, BIGTIFF="IF_SAFER")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs = [(r, c) for r in range(0, H, chunk) for c in range(0, W, chunk)]
         with rasterio.open(out_path, "w", **profile) as dst:
-            for n, t in enumerate(tiles):
-                big = Window(t.col_off - pad, t.row_off - pad, t.width + 2 * pad, t.height + 2 * pad)
-                arr = src.read(window=big, boundless=True, fill_value=0)
-                x = torch.from_numpy(to_model_input(arr, norm))[None]
-                # pad to a multiple of 32 for the encoder
-                H, W = x.shape[-2:]
-                ph, pw = (-H) % 32, (-W) % 32
-                x = torch.nn.functional.pad(x, (0, pw, 0, ph), mode="reflect" if min(H, W) > 32 else "constant")
-                with torch.no_grad():
-                    p = torch.softmax(model(x.to(device)), 1)
-                    if pc.tta:
-                        for dims in ((-1,), (-2,)):
-                            p = p + torch.softmax(model(x.flip(dims).to(device)), 1).flip(dims)
-                        p = p / 3
-                p = p[0, :, pad:pad + int(t.height), pad:pad + int(t.width)].cpu().numpy()
-                valid = (arr[:, pad:pad + int(t.height), pad:pad + int(t.width)] > 0).any(0)
-                out = np.round(p * 255).astype(np.uint8)
-                out[:, ~valid] = np.array([255, 0, 0], np.uint8)[:, None]
-                dst.write(out, window=t)
-                if (n + 1) % 20 == 0 or n + 1 == len(tiles):
-                    progress(f"  predicted {n + 1}/{len(tiles)} tiles")
+            for r, c in tqdm(jobs, desc="predict", unit="chunk"):
+                h, w = min(chunk, H - r), min(chunk, W - c)
+                read = Window(c0 + c - halo, r0 + r - halo, w + 2 * halo, h + 2 * halo)
+                img = src.read(window=read, boundless=True, fill_value=0)
+                if not (img[:, halo:halo + h, halo:halo + w] > 0).any():
+                    continue
+                nodata = (img[:, halo:halo + h, halo:halo + w] == 0).all(axis=0)
+                if ctx_files:
+                    img = np.concatenate([img, CTX.read(ctx_files, src.crs, src.window_transform(read),
+                                                        (img.shape[1], img.shape[2]))])
+                prob = _infer_chunk(net, img, tile, overlap, int(pc.batch_size), dev, n_image)[
+                    :, halo:halo + h, halo:halo + w]
+                out = np.clip(np.round(prob * 254) + 1, 1, 255).astype(np.uint8)  # 0 stays nodata
+                out[:, nodata] = 0
+                dst.write(out, window=Window(c, r, w, h))
+            dst.descriptions = ("background", "interior", "boundary")
+    print(f"Probabilities -> {out_path}")
     return out_path

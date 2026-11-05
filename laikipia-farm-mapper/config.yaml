@@ -1,111 +1,127 @@
-# Laikipia farm digitisation: single configuration file.
-# Paths are relative to this file. Every command and the notebook read this file.
+# Laikipia farm digitisation: high-resolution (Vantor Legion, ~0.3 m) imagery → U-Net → farm polygons.
+# Paths are relative to this file. Every command takes --config to point at another copy.
 
-project:
-  crs: EPSG:32637          # UTM 37N; covers all of Laikipia. Areas are computed in this CRS.
-  resolution_m: 10         # Sentinel-2 native resolution for the visible/NIR bands
+paths:
+  labels: data/labels/manual          # your Google Earth Pro KMZ/KML (+ any GPKG/SHP/GeoJSON) live here
+  aoi: data/aoi/aoi.geojson           # written by `python -m farmmap aoi` (fence corridor + training parcels)
+  imagery_raw: data/imagery/raw       # put the SDX downloads here, unchanged (GeoTIFF / NITF, any sub-folders)
+  scenes: data/imagery/scenes         # ingest writes one aligned, 8-bit GeoTIFF per scene here
+  mosaic: data/imagery/mosaic.vrt     # ...and a VRT that stitches them (newest scene on top)
+  context: data/context               # 10 m context layers: dea.tif (Digital Earth Africa), gee.tif (Earth Engine)
+  tiles: data/tiles                   # training chips + masks (zip this folder for Kaggle)
+  models: data/models
+  outputs: outputs
 
-# --- Area to map: the Laikipia County boundary (downloaded automatically on first use) ---
+# Working area. `python -m farmmap aoi` writes paths.aoi = fence corridor ∪ training-parcel area, plus the
+# small SDX search boxes. When that file exists it replaces `bbox` (the old pilot box, kept as a fallback).
 aoi:
-  county_name: Laikipia
-  county_boundary: data/aoi/laikipia_county.geojson
-
-# --- Reference polygons: YOUR farm polygons digitised in Google Earth Pro ---
-# These are the training labels and the evaluation truth. Export them from Google Earth Pro as
-# KML/KMZ (right-click folder > Save Place As) and drop the files in data/labels/manual/.
-# .shp / .gpkg / .geojson also work. All files there are used automatically.
-reference:
-  polygons: []
-  extra_dirs:
-    - data/labels/manual
-  name_field: FARM_ID
-  # Parcels failing these filters are IGNORED (not used as labels, not scored, not learned as
-  # background). QA_FLAG != OK are the parcels your file marks as having an open data check.
-  # Add SOURCE: [Digitized] to train only on parcels traced from imagery (see README).
-  filters:
-    QA_FLAG: [OK]
-  # Pixels further than this from any reference polygon are IGNORED in training/evaluation
-  # (so partially digitised areas do not teach the model that unlabelled farms are background).
-  coverage_buffer_m: 250
-
-# --- Imagery ---
-imagery:
-  # planetary_computer = free Sentinel-2 L2A, no account or API key needed.
-  # local = use your own GeoTIFF (e.g. licensed high-resolution imagery) at `local_path`.
-  source: planetary_computer
-  local_path: null
-  local_bands: null          # e.g. [B, G, R, NIR]; needed only for local files with NDVI
-  output: data/imagery/laikipia_s2.tif   # main training composite
-  dir: data/imagery          # every other .tif here is an extra scene (used for training + retraining)
-  collection: sentinel-2-l2a
-  bands: [B02, B03, B04, B08, B11, B12]
-  date_range: ["2024-01-01", "2024-03-31"]   # dry season: fewest clouds, strongest field contrast
-  max_cloud_cover: 30        # scene-level %, pre-filter
-  max_scenes_per_tile: 6     # least-cloudy scenes per Sentinel-2 tile used in the median
-  chunk_px: 1024             # processing chunk (keeps memory low, enables resume)
-  # Pilot area [min_lon, min_lat, max_lon, max_lat]. Set to null for the whole county
-  # (~13,000 x 12,000 px; plan for many GB of downloads and several hours).
-  # Best practice: set this to a box around the farms you have digitised.
-  bbox: [36.45, 0.00, 36.75, 0.30]   # densest area of your digitised farms (~8,000 parcels)
+  bbox: [36.45, 0.00, 36.75, 0.30]
+  crs: EPSG:32637                     # UTM 37N, metres (Laikipia lies in zone 37)
+  fence_layers:                       # the West Laikipia Fence is split over two files: use both
+    - path: data/aoi/fences/Laikipia Fences.shp
+      where: {Fence: [WLF]}           # LNC, Mugie and Ol Pejeta sections
+    - path: data/aoi/fences/WLF.shp   # central section
+  fence_buffer_m: 5000
+  include_labels:                     # also cover these training parcels so the model has imagery to learn from
+    SOURCE: [Digitized]               # traced parcels (incl. your new farms), not the scheme layer
+  label_buffer_m: 300
+  search_box_km: 20                   # SDX searches by box only: 19 boxes cover the corridor
 
 labels:
-  dir: data/labels           # <scene>_labels.tif is written here for every scene
-  boundary_width_px: 1       # width of the "boundary" class. Small parcels need thin lines (1 px = 10 m)
+  # Parcels that do NOT match these filters are not thrown away: they become "ignore" pixels
+  # (not farm, not background, not scored), because they are still real farms.
+  keep:
+    QA_FLAG: [OK]
+    SOURCE: [Digitized, Scheme layer]  # use [Digitized] if `check` shows the scheme layer is misregistered
+  # Groups taken out of training (also become "ignore" pixels), e.g. schemes `check` calls SHIFTED/UNCLEAR.
+  # Values must match the CSV exactly. The 5 below are the ones the Sentinel-2 check flagged (118 parcels).
+  drop:
+    SCHEME: ["G.L.(Rumuruti Forest", "G.L.(Rware)", "Maundu ni meri Outspan", "Ndindika SFT", "Thome Outspan"]
+  # Polygons drawn in the "New farms" folder have no SOURCE/QA_FLAG; they get these values
+  defaults:
+    SOURCE: Digitized
+    QA_FLAG: OK
+  # Pixels further than this from any parcel are ignored: your file does not cover every farm,
+  # so "no polygon here" is only trusted as background close to mapped farms.
+  context_m: 30
+  # Optional per-group shifts (metres, east/north) to fix misregistered scheme plans.
+  # `python -m farmmap check` writes suggested values to outputs/registration_shifts.yaml.
+  shift_by: SCHEME
+  shifts: {}
 
-# --- Spatial hold-out: whole blocks are assigned to train / val / test ---
-split:
-  block_px: 512              # 5 km blocks
-  val_fraction: 0.15
-  test_fraction: 0.15
+imagery:
+  gsd_m: 0.5                          # training/prediction pixel size. 0.3 m native is ~3x slower for little gain on fences
+  bands: auto                         # or 1-based indices of [R, G, B, NIR] in the multispectral file, e.g. [5, 3, 2, 7]
+  use_nir: true                       # NIR helps separate crops from grass/bush; set false for RGB-only products
+  pansharpen: auto                    # auto = sharpen when a PAN file is found next to its MS file
+  rpc_height_m: 1800                  # used only for un-orthorectified files with RPCs and no DEM
+  dem: null                           # optional DEM GeoTIFF for RPC orthorectification (better on slopes)
+  stretch_percentiles: [1, 99]        # per-scene contrast stretch to 8 bit (0 is reserved for nodata)
+  newest_on_top: true
+
+# Context layers: free 10 m multi-date data stacked onto every chip as extra bands (see farmmap/context.py).
+# Build with `python -m farmmap context --sources dea gee`; `use` decides what the model sees, so experiments
+# differ only in this list. [] = image only. Prediction re-attaches whatever the model was trained with.
+context:
+  use: []                             # e.g. [dea] or [dea, gee]
+  year: 2025                          # season to describe: the year of your Legion scenes
+  gsd_m: 10
+  dea_block_px: 1024
+  gee:
+    embedding_components: 6           # AlphaEarth 64-D embedding -> this many principal components
+    pca_sample_blocks: 40
+    block_px: 512                     # 512 x 512 x 64 int8 = 16 MB per request (Earth Engine limit 48 MB)
+    nicfi_months: []                  # e.g. ["2025-02", "2025-08"]: dry and wet season NDVI (NICFI sign-up needed)
+
+# Earth Engine account (only for `context --sources gee` and `nicfi`): your Google Cloud project id
+gee:
+  project: null
+
+tiles:
+  size_px: 512                        # 256 m at 0.5 m
+  boundary_width_m: 1.5               # width of the "boundary" class drawn along every parcel outline
+  min_label_fraction: 0.10            # skip chips where less than this share is labelled (non-ignore)
+  max_nodata_fraction: 0.30
+  block_m: 2000                       # train/val/test split is by 2 km map blocks, so test areas are truly unseen
+  split: {train: 0.70, val: 0.15, test: 0.15}
   seed: 42
-  file: data/labels/split.json   # persisted so the test set stays fixed when you retrain
 
 model:
-  encoder: resnet18          # light enough for a CPU laptop. resnet34 is a bit more accurate, ~2x slower
-  encoder_weights: imagenet  # downloaded on first use; set null to train from scratch offline
-  checkpoint: data/models/unet_best.pt
-  add_ndvi: true
+  arch: Unet                          # any segmentation_models_pytorch architecture (Unet, UnetPlusPlus, FPN...)
+  encoder: resnet34
+  encoder_weights: imagenet           # pretrained encoder; matters a lot with ~10k parcels
 
 train:
-  crop_px: 256
-  batch_size: 8
-  epochs: 20
-  steps_per_epoch: 100
-  val_crops: 160
+  epochs: 40
+  batch_size: 16                      # Kaggle T4/P100 (16 GB): 16 at 512 px
   lr: 0.0003
-  finetune_lr: 0.0001        # used when retraining from an existing checkpoint
   weight_decay: 0.0001
-  class_weights: [1.0, 1.0, 3.0]   # background, farm interior, boundary
-  patience: 8                # early stopping (epochs without val improvement)
-  num_workers: 0
-  device: auto               # auto | cuda | mps | cpu
-  seed: 42
+  num_workers: 2
+  amp: true                           # mixed precision on GPU
+  class_weights: [1.0, 1.0, 3.0]      # background, interior, boundary (boundaries are thin, so up-weighted)
+  dice_weight: 1.0
+  seed: 42                            # fixed so experiments A/B/C differ only in their labels
 
 predict:
   tile_px: 512
-  pad_px: 64                 # context discarded around each tile to avoid edge artefacts
-  tta: true                  # average over horizontal/vertical flips
+  overlap_px: 128
+  chunk_px: 2048                      # processed in chunks so any area fits in RAM
+  batch_size: 8
 
 polygonize:
-  interior_threshold: 0.5    # P(interior) needed to seed a farm
-  boundary_threshold: 0.4    # P(boundary) above this splits neighbouring farms
-  min_area_ha: 0.1           # smallest polygon kept (0.1 ha = 1,000 m2)
-  simplify_m: 3
-  fill_holes_ha: 0.02
-  seed_opening: false        # true removes speckle but also deletes parcels narrower than 3 px
+  marker_threshold: 0.55              # interior minus boundary above this seeds one farm
+  mask_threshold: 0.45                # interior + boundary above this is "inside some farm"
+  min_area_m2: 300                    # drop slivers (0.03 ha)
+  hole_area_m2: 300                   # fill holes smaller than this
+  simplify_m: 0.75
+  block_px: 4096
+  halo_px: 1024                       # farms bigger than about halo x gsd may be split, then merged across blocks
+  context_filter: null                # e.g. {band: "ctx:dea:crop_prob", min: 10}: drop farms that are not cropland
 
-# Delineate Anything (optional engine): needs `pip install -r requirements-da.txt`
-delineate:
-  weights: data/models/DelineateAnythingv2.pt
-  weights_url: https://huggingface.co/MykolaL/DelineateAnything/resolve/main/DelineateAnythingv2.pt
-  upsample: 2                # Sentinel-2 is resampled up before detection; compare 1, 2, 4 with `compare`
-  tile_px: 512               # tile size at native resolution
-  overlap_px: 64
-  imgsz: 640
-  conf: 0.2
-  iou: 0.5
-  stretch_percentiles: [2, 98]
-
-outputs:
-  dir: outputs
-  kmz_name: laikipia_farm_polygons
+evaluate:
+  iou_match: 0.5
+  # Parcels the model is scored against, independent of what it was trained on, so experiments with
+  # different training labels are compared on the same trusted (hand-traced) reference.
+  reference:
+    QA_FLAG: [OK]
+    SOURCE: [Digitized]

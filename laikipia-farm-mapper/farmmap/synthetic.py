@@ -1,77 +1,66 @@
-"""Synthetic 'farms' scene for smoke-testing the whole pipeline offline (no download, no real data).
+"""Synthetic stand-in for an SDX download, to test the whole pipeline offline.
 
-This only proves the code runs end to end. Its accuracy numbers say nothing about real Laikipia.
+Writes a Maxar/Vantor-style pair (PAN 0.25 m single band + MS 1.0 m BGRN, uint16, with P1BS/M1BS names)
+of Voronoi "fields" separated by dark fence lines, and the fields as a KMZ in the Earth Pro schema.
+Numbers produced on it say nothing about accuracy in Laikipia.
 """
 from __future__ import annotations
 
-import copy
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.features import shapes
+from rasterio.features import rasterize
 from rasterio.transform import from_origin
-from scipy import ndimage as ndi
-from scipy.spatial import cKDTree
-from shapely.geometry import shape
+from shapely.geometry import MultiPoint, box
+from shapely.ops import voronoi_diagram
+
+from .export import to_kmz
 
 
-def make_demo_data(out_dir, size=1536, n_fields=28, n_bands=6, seed=0, crs="EPSG:32637"):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def make_scene(out_dir: Path, size_m: float = 800, n_fields: int = 60, seed: int = 0,
+               origin=(270000.0, 12000.0), crs="EPSG:32637") -> tuple[Path, Path]:
+    """Returns (raw imagery folder, labels folder)."""
     rng = np.random.default_rng(seed)
-    transform = from_origin(250000, 30000, 10, 10)
-
-    seeds = rng.uniform(0, size, (n_fields, 2))
-    yy, xx = np.mgrid[:size, :size]
-    _, ids = cKDTree(seeds).query(np.c_[yy.ravel(), xx.ravel()])
-    ids = ids.reshape(size, size)
-
-    base = rng.uniform(0.05, 0.35, (n_bands,))
-    sig = base + rng.normal(0, 0.05, (n_fields, n_bands))
-    img = sig[ids].transpose(2, 0, 1).copy()
-    for b in range(n_bands):  # field texture + noise
-        img[b] += ndi.gaussian_filter(rng.normal(0, 1, (size, size)), 6) * 0.04
-        img[b] += rng.normal(0, 0.01, (size, size))
-    edge = (ndi.maximum_filter(ids, 3) != ndi.minimum_filter(ids, 3))
-    img[:, edge] += 0.12  # fences / tracks between farms
-    arr = np.clip(np.round(img * 10000), 1, 10000).astype(np.uint16)
-
-    img_path = out_dir / "demo_imagery.tif"
-    with rasterio.open(img_path, "w", driver="GTiff", width=size, height=size, count=n_bands, dtype="uint16",
-                       crs=crs, transform=transform, nodata=0, tiled=True, blockxsize=256, blockysize=256,
-                       compress="deflate") as dst:
-        dst.write(arr)
-
-    polys = [shape(g) for g, v in shapes(ids.astype(np.int32), transform=transform)]
-    gpd.GeoDataFrame({"NAME_96": [f"demo farm {i}" for i in range(len(polys))]}, geometry=polys, crs=crs) \
-        .to_file(out_dir / "demo_reference.gpkg", driver="GPKG")
-    return img_path, out_dir / "demo_reference.gpkg"
-
-
-def demo_config(cfg, out_dir, epochs=6):
-    """A copy of `cfg` pointed at the synthetic data, with a tiny fast model."""
     out_dir = Path(out_dir)
-    c = copy.deepcopy(cfg)
-    c.reference.polygons = [str(out_dir / "demo_reference.gpkg")]
-    c.reference.extra_dirs = []
-    c.reference.name_field = "NAME_96"
-    c.imagery.bbox = None
-    c.imagery.source = "local"
-    c.imagery.local_path = str(out_dir / "demo_imagery.tif")
-    c.imagery.local_bands = list(cfg.imagery.bands)
-    c.imagery.output = str(out_dir / "demo_imagery.tif")
-    c.imagery.dir = str(out_dir)
-    c.labels.dir = str(out_dir / "labels")
-    c.split.file = str(out_dir / "split.json")
-    c.split.block_px = 512
-    c.model.encoder = "resnet18"
-    c.model.encoder_weights = None
-    c.model.checkpoint = str(out_dir / "unet_best.pt")
-    c.train.epochs, c.train.steps_per_epoch, c.train.batch_size = epochs, 12, 8
-    c.train.val_crops, c.train.crop_px, c.train.patience = 32, 128, 99
-    c.predict.tile_px, c.predict.pad_px, c.predict.tta = 256, 32, False
-    c.polygonize.min_area_ha = 5.0
-    c.outputs.dir = str(out_dir / "outputs")
-    return c
+    raw, lab = out_dir / "raw", out_dir / "labels"
+    raw.mkdir(parents=True, exist_ok=True)
+    lab.mkdir(parents=True, exist_ok=True)
+    x0, y0 = origin
+    area = box(x0, y0, x0 + size_m, y0 + size_m)
+    pts = MultiPoint(list(zip(rng.uniform(x0, x0 + size_m, n_fields), rng.uniform(y0, y0 + size_m, n_fields))))
+    cells = [c.intersection(area) for c in voronoi_diagram(pts, envelope=area).geoms]
+    fields = gpd.GeoDataFrame({"geometry": [c for c in cells if c.area > 50]}, crs=crs)
+
+    pan_gsd, ms_gsd = 0.25, 1.0
+    n = int(size_m / pan_gsd)
+    t_pan = from_origin(x0, y0 + size_m, pan_gsd, pan_gsd)
+    ids = rasterize([(g, i + 1) for i, g in enumerate(fields.geometry)], out_shape=(n, n), transform=t_pan,
+                    dtype="int32")
+    refl = rng.uniform([300, 400, 300, 1500], [700, 900, 1000, 4000], (len(fields) + 1, 4)).astype(np.float32)
+    bands = refl[ids].transpose(2, 0, 1)  # (4, n, n) B, G, R, N
+    fences = rasterize([(g, 1) for g in fields.geometry.boundary.buffer(0.6)], out_shape=(n, n), transform=t_pan,
+                       dtype="uint8").astype(bool)
+    bands[:, fences] *= 0.45
+    bands += rng.normal(0, 25, bands.shape).astype(np.float32)
+    pan = bands[:3].mean(axis=0) * 1.7 + 50  # different DN scale from MS, like real PAN
+    f = int(ms_gsd / pan_gsd)
+    ms = bands.reshape(4, n // f, f, n // f, f).mean(axis=(2, 4))
+
+    base = "23JAN15081234-{}-SYNTH_P001"
+    common = dict(driver="GTiff", dtype="uint16", crs=crs, nodata=0)
+    pan_path, ms_path = raw / f"{base.format('P1BS')}.TIF", raw / f"{base.format('M1BS')}.TIF"
+    with rasterio.open(pan_path, "w", width=n, height=n, count=1, transform=t_pan, **common) as d:
+        d.write(np.clip(pan, 1, 65535).astype(np.uint16), 1)
+    with rasterio.open(ms_path, "w", width=n // f, height=n // f, count=4,
+                       transform=from_origin(x0, y0 + size_m, ms_gsd, ms_gsd), **common) as d:
+        d.write(np.clip(ms, 1, 65535).astype(np.uint16))
+        d.descriptions = ("Blue", "Green", "Red", "NIR")
+
+    fields["FARM_ID"] = [f"SYN-{i:04d}" for i in range(len(fields))]
+    fields["SOURCE"] = np.where(rng.random(len(fields)) < 0.5, "Digitized", "Scheme layer")
+    fields["QA_FLAG"] = np.where(rng.random(len(fields)) < 0.05, "OVERLAP", "OK")
+    fields["SCHEME"] = "Synthetic"
+    to_kmz(fields, lab / "synthetic_farms.kmz", name="Synthetic farms")
+    return raw, lab

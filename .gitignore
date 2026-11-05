@@ -4,3 +4,25 @@ venv/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.pytest_cache/
+
+# secrets
+.env
+
+# large / licensed data: commercial imagery must never be committed (CSDA licence)
+laikipia-farm-mapper/data/imagery/
+laikipia-farm-mapper/data/tiles/
+laikipia-farm-mapper/data/tiles_*/
+laikipia-farm-mapper/data/models/
+laikipia-farm-mapper/data/models_*/
+laikipia-farm-mapper/data/context/
+laikipia-farm-mapper/data/cache/
+laikipia-farm-mapper/outputs/
+*.tif
+*.tiff
+*.vrt
+*.ntf
+*.NTF
+
+# original GIS layers: kept on disk, not in git (the code uses only the copies in data/aoi/fences/)
+Map_Layers/

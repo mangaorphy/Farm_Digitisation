@@ -1,263 +1,176 @@
-"""Command line: python -m farmmap <command> [options]   (run from the project folder)"""
+"""Command line: python -m farmmap <command> [--config config.yaml] [--set key=value ...]
+
+  labels       summarise your parcels at the training resolution
+  aoi          fence corridor + training-parcel area -> data/aoi/ (AOI, SDX search boxes, KMZ to view)
+  ingest      SDX downloads in data/imagery/raw -> aligned 8-bit scenes + mosaic.vrt
+  check        registration check: are parcel outlines on visible edges? suggests per-scheme shifts
+  context      fetch 10 m context layers: --sources dea (Digital Earth Africa, open) gee (Earth Engine)
+  sentinel2    export a cloud-free Sentinel-2 composite (DE Africa, no login) as a scene (use config_s2.yaml)
+  nicfi        export a Planet NICFI monthly basemap from Earth Engine as a scene (use config_nicfi.yaml)
+  tiles        cut training chips + masks (zip data/tiles for Kaggle)
+  train        train the U-Net (Kaggle GPU)
+  predict      model -> probability raster (whole mosaic, or --split test / --bbox)
+  polygonize   probabilities -> farms.gpkg
+  evaluate     score farms.gpkg against your parcels on held-out test blocks
+  export       farms.gpkg -> farms.kmz for Google Earth Pro
+  run          predict + polygonize + export in one go
+  demo         full pipeline on a synthetic scene (install check)
+"""
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 import tempfile
 from pathlib import Path
 
+import geopandas as gpd
+from rasterio.warp import transform_bounds
 
-def _cfg(args):
-    from .config import load_config
-
-    return load_config(args.config)
-
-
-def cmd_info(args):
-    from .imagery import estimate
-
-    cfg = _cfg(args)
-    print(json.dumps(estimate(cfg, _aoi(cfg, args), args.bbox), indent=2))
+from . import config as C
 
 
-def _aoi(cfg, args):
-    """--county uses the Laikipia boundary file; otherwise --aoi (or None)."""
-    if getattr(args, "county", False):
-        from .county import county_path
-
-        return county_path(cfg)
-    return getattr(args, "aoi", None)
-
-
-def cmd_county(args):
-    from .county import download_county_boundary
-
-    cfg = _cfg(args)
-    p = download_county_boundary(cfg.path(cfg.aoi.county_boundary), cfg.aoi.county_name)
-    print(f"County boundary saved: {p}")
+def _bounds(cfg, args):
+    if getattr(args, "bbox", None):
+        return transform_bounds("EPSG:4326", cfg.aoi.crs, *args.bbox)
+    if getattr(args, "split", None):
+        from .labels import load_labels
+        from .tiles import blocks_gdf
+        lab = load_labels(cfg)
+        b = blocks_gdf(lab.total_bounds, cfg)
+        ctx = lab.geometry.buffer(float(cfg.labels.context_m)).union_all()
+        sel = b[(b.split == args.split) & b.intersects(ctx)]
+        return tuple(sel.total_bounds)
+    return None
 
 
-def cmd_fetch(args):
-    from .imagery import fetch_composite
+def demo(args) -> None:
+    from . import evaluate, export, imagery, polygonize, predict, synthetic, tiles, train
 
-    cfg = _cfg(args)
-    out = fetch_composite(cfg, out_path=args.out, aoi_path=_aoi(cfg, args), bbox=args.bbox)
-    print(f"Imagery: {out}")
-
-
-def cmd_labels(args):
-    from .pipeline import prepare_training_data
-
-    scenes = prepare_training_data(_cfg(args), only=args.imagery)
-    for sc in scenes:
-        print(f"Scene {sc['name']}: {sc['labels']}")
-
-
-def cmd_check(args):
-    """Do the polygon outlines sit on visible edges? (per SOURCE)"""
-    from .diagnostics import registration_check
-    from .pipeline import main_imagery
-
-    cfg = _cfg(args)
-    res = registration_check(cfg, args.imagery or main_imagery(cfg), group_by=args.group_by)
-    for name, r in res.items():
-        print(json.dumps({name: {k: v for k, v in r.items() if k != "grid"}}, indent=2))
-    print("Interpretation: best shift should be (0, 0) m. A clearly different best shift or contrast "
-          "<= ~1.0 means those outlines are not registered to the imagery (they are not traced on it).")
+    work = Path(args.workdir or tempfile.mkdtemp(prefix="farmmap_demo_"))
+    raw, lab = synthetic.make_scene(work)
+    cfg = C.load(args.config, [
+        f"paths.imagery_raw={raw}", f"paths.labels={lab}", f"paths.scenes={work / 'scenes'}",
+        f"paths.mosaic={work / 'mosaic.vrt'}", f"paths.tiles={work / 'tiles'}", f"paths.models={work / 'models'}",
+        f"paths.outputs={work / 'outputs'}", f"paths.aoi={work / 'no_aoi.geojson'}", "aoi.bbox=null",
+        "tiles.size_px=256", "tiles.block_m=200",
+        "tiles.split={train: 0.6, val: 0.2, test: 0.2}", "train.batch_size=4", "train.num_workers=0",
+        f"model.encoder={args.encoder}", "model.encoder_weights=null", "predict.tile_px=256",
+        "predict.overlap_px=64", "predict.chunk_px=1024", "polygonize.block_px=1024", "polygonize.halo_px=256",
+        *(args.set or [])])
+    imagery.ingest(cfg)
+    tiles.make_tiles(cfg)
+    best = train.train(cfg, epochs=args.epochs)
+    prob = predict.predict(cfg, best)
+    farms = polygonize.polygonize(cfg, prob)
+    evaluate.evaluate(cfg, Path(cfg.paths.outputs) / "farms.gpkg", split="all")
+    export.to_kmz(farms, Path(cfg.paths.outputs) / "farms.kmz")
+    print(f"Demo OK: {len(farms)} polygons in {work}")
 
 
-def cmd_diagnose(args):
-    """Why is training not improving? Imagery stats + simple baseline + memorise-one-batch test."""
-    from .diagnostics import diagnose
-
-    diagnose(_cfg(args))
-
-
-def cmd_da_predict(args):
-    """Delineate Anything on a GeoTIFF -> GeoPackage + KMZ."""
-    from .delineate import delineate
-    from .export import export_polygons
-    from .pipeline import main_imagery
-
-    cfg = _cfg(args)
-    img = Path(args.imagery) if args.imagery else main_imagery(cfg)
-    name = args.name or f"{img.stem}_da"
-    frame = delineate(cfg, img, upsample=args.upsample)
-    gpkg, kmz = export_polygons(frame, cfg.path(cfg.outputs.dir) / name, f"{cfg.outputs.kmz_name}_{name}")
-    print(f"{len(frame)} fields -> {gpkg}\n  open in Google Earth Pro: {kmz}")
-
-
-def cmd_compare(args):
-    """Same test blocks, same scorer: U-Net vs Delineate Anything (several upsampling factors)."""
-    import pandas as pd
-
-    from .compare import compare_engines
-
-    cfg = _cfg(args)
-    only = {}
-    for item in args.only or []:
-        key, _, vals = item.partition("=")
-        only[key] = vals.split(",")
-    df = compare_engines(cfg, which=args.split, unet_checkpoint=args.checkpoint,
-                         da_upsamples=tuple(args.upsample), polygon_files=args.polygons or (), only=only)
-    pd.set_option("display.width", 200, "display.max_columns", 30)
-    print(df.to_string())
-    out = cfg.path(cfg.outputs.dir) / "compare.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out)
-    print(f"saved {out}")
-
-
-def cmd_prepare(args):
-    """Reproject / drop bands / resample any GeoTIFF so the pipeline can use it."""
-    from .prepare import prepare_imagery
-
-    cfg = _cfg(args)
-    prepare_imagery(args.src, args.dst, crs=args.crs or cfg.project.crs, resolution=args.resolution,
-                    bands=args.bands, resampling=args.resampling)
-
-
-def cmd_train(args):
-    from .train import train
-
-    cfg = _cfg(args)
-    res = train(cfg, init_checkpoint=args.init, epochs=args.epochs, out_checkpoint=args.out)
-    print(f"Best epoch {res['best'].get('epoch')}  score={res['best'].get('score', 0):.3f}  -> {res['checkpoint']}")
-
-
-def cmd_evaluate(args):
-    from .evaluate import evaluate
-
-    cfg = _cfg(args)
-    res = evaluate(cfg, checkpoint=args.checkpoint, which=args.split)
-    print(json.dumps(res, indent=2))
-
-
-def cmd_predict(args):
-    from .imagery import fetch_composite
-    from .pipeline import predict_area
-
-    cfg = _cfg(args)
-    if args.imagery:
-        img = Path(args.imagery)
-    elif args.aoi or args.bbox or args.county:
-        aoi = _aoi(cfg, args)
-        name = args.name or ("laikipia_county" if args.county else Path(args.aoi).stem if args.aoi else "area")
-        img = cfg.path(cfg.imagery.dir) / f"{name}.tif"
-        if not img.exists() or img.with_suffix(".progress.json").exists():
-            fetch_composite(cfg, out_path=img, aoi_path=aoi, bbox=args.bbox)
-    else:
-        sys.exit("Give --county, --aoi FILE, --bbox W S E N or --imagery GEOTIFF.")
-    name = args.name or img.stem
-    res = predict_area(cfg, img, name, checkpoint=args.checkpoint)
-    print(f"{len(res['frame'])} farms -> {res['gpkg']}\n  open in Google Earth Pro: {res['kmz']}")
-
-
-def cmd_demo(args):
-    """Synthetic end-to-end smoke test (about 1-3 min on CPU, no internet)."""
-    from .config import load_config
-    from .evaluate import evaluate
-    from .pipeline import predict_area, prepare_training_data
-    from .synthetic import demo_config, make_demo_data
-    from .train import train
-
-    base = load_config(args.config)
-    out = Path(args.out or tempfile.mkdtemp(prefix="farmmap_demo_"))
-    make_demo_data(out)
-    cfg = demo_config(base, out, epochs=args.epochs)
-    scenes = prepare_training_data(cfg)
-    res = train(cfg, scenes)
-    print("best:", {k: round(float(v), 3) for k, v in res["best"].items() if k != "epoch"})
-    print(json.dumps(evaluate(cfg, scenes), indent=2))
-    pred = predict_area(cfg, scenes[0]["imagery"], "demo")
-    print(f"Demo OK: {len(pred['frame'])} polygons -> {pred['kmz']}")
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(prog="farmmap", description="Laikipia farm digitisation")
-    p.add_argument("--config", default="config.yaml")
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(prog="farmmap", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default="config.yaml")
+    common.add_argument("--set", nargs="+", action="extend", metavar="KEY=VALUE",
+                        help="override config after the command, e.g. tiles --set tiles.size_px=384")
     sub = p.add_subparsers(dest="cmd", required=True)
-
-    s = sub.add_parser("county", help="download the Laikipia County boundary (done automatically if missing)")
-    s.set_defaults(fn=cmd_county)
-
-    s = sub.add_parser("info", help="size of the imagery download for the configured area")
-    s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
-    s.add_argument("--aoi")
-    s.add_argument("--county", action="store_true", help="whole Laikipia County")
-    s.set_defaults(fn=cmd_info)
-
-    s = sub.add_parser("fetch", help="download a cloud-free Sentinel-2 composite (resumable)")
-    s.add_argument("--aoi", help="GeoJSON/KML/KMZ/SHP polygon of the area")
-    s.add_argument("--county", action="store_true", help="whole Laikipia County")
-    s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+    add = lambda name: sub.add_parser(name, parents=[common])  # noqa: E731
+    add("labels")
+    add("aoi")
+    s = add("ingest")
+    s.add_argument("--only", nargs="*", help="scene ids")
+    s = add("check")
+    s.add_argument("--max-shift", type=float, default=40.0)
+    s.add_argument("--per-group", type=int, default=300)
+    s = add("context")
+    s.add_argument("--sources", nargs="+", default=["dea"], choices=["dea", "gee"])
+    s = add("sentinel2")
+    s.add_argument("--period", required=True, help="YYYY (annual), YYYY-H1 (Jan-Jun) or YYYY-H2 (Jul-Dec)")
+    s.add_argument("--out", help="folder (default: paths.imagery_raw)")
+    s = add("nicfi")
+    s.add_argument("--month", required=True, help="YYYY-MM, e.g. 2025-06")
+    s.add_argument("--out", help="folder (default: paths.imagery_raw)")
+    add("tiles")
+    s = add("train")
+    s.add_argument("--tiles")
     s.add_argument("--out")
-    s.set_defaults(fn=cmd_fetch)
-
-    s = sub.add_parser("labels", help="rasterise your manual polygons into training masks (all scenes)")
-    s.add_argument("--imagery", help="only this scene")
-    s.set_defaults(fn=cmd_labels)
-
-    s = sub.add_parser("check", help="registration check: do polygon outlines sit on image edges?")
-    s.add_argument("--imagery")
-    s.add_argument("--group-by", default="SOURCE")
-    s.set_defaults(fn=cmd_check)
-
-    s = sub.add_parser("diagnose", help="sanity checks before/after a failed training run")
-    s.set_defaults(fn=cmd_diagnose)
-
-    s = sub.add_parser("da-predict", help="Delineate Anything on imagery -> polygons (needs requirements-da.txt)")
-    s.add_argument("--imagery")
-    s.add_argument("--name")
-    s.add_argument("--upsample", type=int)
-    s.set_defaults(fn=cmd_da_predict)
-
-    s = sub.add_parser("compare", help="score U-Net vs Delineate Anything on held-out blocks")
-    s.add_argument("--split", default="test", choices=["test", "val"])
-    s.add_argument("--checkpoint", help="U-Net checkpoint (default: model.checkpoint if it exists)")
-    s.add_argument("--upsample", type=int, nargs="+", default=[1, 2, 4], help="DA upsampling factors")
-    s.add_argument("--polygons", nargs="*", help="extra polygon files to score (e.g. official DA output)")
-    s.add_argument("--only", nargs="*", metavar="COL=VAL[,VAL]",
-                   help="score only reference farms with these attribute values, e.g. SOURCE=Digitized")
-    s.set_defaults(fn=cmd_compare)
-
-    s = sub.add_parser("prepare-imagery", help="make your own GeoTIFF usable (CRS, bands, resolution)")
-    s.add_argument("src")
-    s.add_argument("dst")
-    s.add_argument("--crs", help="default: project.crs")
-    s.add_argument("--resolution", type=float, help="output pixel size in metres, e.g. 2")
-    s.add_argument("--bands", type=int, nargs="+", help="1-based bands to keep, e.g. 1 2 3 (drops alpha)")
-    s.add_argument("--resampling", default="bilinear", choices=["nearest", "bilinear", "cubic", "average"])
-    s.set_defaults(fn=cmd_prepare)
-
-    s = sub.add_parser("train", help="train, or retrain with --init to fine-tune")
-    s.add_argument("--init", help="checkpoint to fine-tune from")
     s.add_argument("--epochs", type=int)
-    s.add_argument("--out", help="where to save the new checkpoint (default: model.checkpoint)")
-    s.set_defaults(fn=cmd_train)
-
-    s = sub.add_parser("evaluate", help="metrics on held-out blocks")
-    s.add_argument("--split", default="test", choices=["test", "val", "train"])
-    s.add_argument("--checkpoint", help="model to score (default: model.checkpoint)")
-    s.set_defaults(fn=cmd_evaluate)
-
-    s = sub.add_parser("predict", help="imagery -> farm polygons (GeoPackage + KMZ)")
-    s.add_argument("--aoi")
-    s.add_argument("--county", action="store_true", help="whole Laikipia County")
-    s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
-    s.add_argument("--imagery", help="use this GeoTIFF instead of downloading")
-    s.add_argument("--name")
-    s.add_argument("--checkpoint")
-    s.set_defaults(fn=cmd_predict)
-
-    s = sub.add_parser("demo", help="offline synthetic smoke test of the whole pipeline")
+    s.add_argument("--fresh", action="store_true", help="ignore last.pt and start over")
+    for name in ("predict", "run"):
+        s = add(name)
+        s.add_argument("--model", default=None)
+        s.add_argument("--raster")
+        s.add_argument("--out")
+        s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+        s.add_argument("--split", choices=["train", "val", "test"])
+    s = add("polygonize")
+    s.add_argument("--prob", required=True)
     s.add_argument("--out")
-    s.add_argument("--epochs", type=int, default=6)
-    s.set_defaults(fn=cmd_demo)
-
+    s = add("evaluate")
+    s.add_argument("--pred", required=True)
+    s.add_argument("--split", default="test", choices=["train", "val", "test", "all"])
+    s = add("export")
+    s.add_argument("--pred", required=True)
+    s.add_argument("--out")
+    s = add("demo")
+    s.add_argument("--workdir")
+    s.add_argument("--epochs", type=int, default=8)
+    s.add_argument("--encoder", default="resnet18")
     args = p.parse_args(argv)
-    args.fn(args)
+
+    if args.cmd == "demo":
+        return demo(args)
+    cfg = C.load(args.config, args.set)
+    if args.cmd == "labels":
+        from .labels import load_labels, summary
+        g = load_labels(cfg)
+        print(f"{len(g)} parcels in AOI, {int(g.train.sum())} used for training\n")
+        print(summary(g, float(cfg.imagery.gsd_m)).to_string())
+    elif args.cmd == "aoi":
+        from .aoi import build
+        build(cfg)
+    elif args.cmd == "ingest":
+        from .imagery import ingest
+        ingest(cfg, args.only)
+    elif args.cmd == "check":
+        from .register import check
+        check(cfg, args.max_shift, args.per_group)
+    elif args.cmd == "context":
+        from .context import build
+        build(cfg, args.sources)
+    elif args.cmd == "sentinel2":
+        from .context import export_s2
+        export_s2(cfg, args.period, Path(args.out) if args.out else None)
+    elif args.cmd == "nicfi":
+        from .gee import export_nicfi
+        export_nicfi(cfg, args.month, Path(args.out) if args.out else None)
+    elif args.cmd == "tiles":
+        from .tiles import make_tiles
+        make_tiles(cfg)
+    elif args.cmd == "train":
+        from .train import train
+        train(cfg, args.tiles, args.out, args.epochs, resume=not args.fresh)
+    elif args.cmd in ("predict", "run"):
+        from .predict import predict
+        model = Path(args.model or Path(cfg.paths.models) / "best.pt")
+        tag = args.split or ("bbox" if args.bbox else "all")
+        prob = predict(cfg, model, args.raster, Path(cfg.paths.outputs) / f"probabilities_{tag}.tif",
+                       _bounds(cfg, args))
+        if args.cmd == "run":
+            from .export import to_kmz
+            from .polygonize import polygonize
+            out = Path(args.out or Path(cfg.paths.outputs) / f"farms_{tag}.gpkg")
+            farms = polygonize(cfg, prob, out)
+            to_kmz(farms, out.with_suffix(".kmz"))
+    elif args.cmd == "polygonize":
+        from .polygonize import polygonize
+        polygonize(cfg, Path(args.prob), Path(args.out) if args.out else None)
+    elif args.cmd == "evaluate":
+        from .evaluate import evaluate
+        evaluate(cfg, Path(args.pred), args.split)
+    elif args.cmd == "export":
+        from .export import to_kmz
+        pred = Path(args.pred)
+        to_kmz(gpd.read_file(pred), Path(args.out) if args.out else pred.with_suffix(".kmz"))
 
 
 if __name__ == "__main__":

@@ -1,152 +1,196 @@
-"""Training and retraining (fine-tuning) of the U-Net."""
+"""Train the U-Net on chips from `tiles` (designed for a Kaggle GPU; also runs, slowly, on CPU).
+
+Loss = class-weighted cross-entropy + soft Dice on interior/boundary, both skipping ignore (255) pixels.
+Checkpoints: last.pt every epoch (resume after a Kaggle session ends) and best.pt by validation
+mean IoU of interior and boundary.
+"""
 from __future__ import annotations
 
 import csv
-import random
+import math
 import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import rasterio
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
-from .data import CropDataset, ensure_norm, load_or_create_split, n_channels, split_blocks
-from .labels import IGNORE
-from .model import build_model, load_checkpoint, pick_device, save_checkpoint
+from . import model as M
+from .config import to_plain
+
+IGNORE = 255
 
 
-def confusion(pred, target, n=3):
-    keep = target != IGNORE
-    idx = target[keep] * n + pred[keep]
-    return np.bincount(idx, minlength=n * n).reshape(n, n)
+class ChipDataset(Dataset):
+    def __init__(self, tiles_dir: Path, ids: list[str], augment: bool):
+        self.dir, self.ids, self.augment = Path(tiles_dir), list(ids), augment
+        with rasterio.open(self.dir / "images" / f"{self.ids[0]}.tif") as s:
+            self.n_image = n_image_bands(s.descriptions)
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, i):
+        tid = self.ids[i]
+        with rasterio.open(self.dir / "images" / f"{tid}.tif") as s:
+            img = s.read()
+        with rasterio.open(self.dir / "masks" / f"{tid}.tif") as s:
+            mask = s.read(1)
+        if self.augment:
+            k = np.random.randint(4)
+            img, mask = np.rot90(img, k, axes=(1, 2)), np.rot90(mask, k)
+            if np.random.rand() < 0.5:
+                img, mask = img[:, :, ::-1], mask[:, ::-1]
+            # per-band brightness/contrast jitter on the image bands only (scenes differ in sun angle and haze);
+            # context bands have fixed physical scales and are left alone
+            n = self.n_image
+            im = img[:n]
+            valid = im > 0
+            gain = np.random.uniform(0.85, 1.15, (n, 1, 1))
+            bias = np.random.uniform(-12, 12, (n, 1, 1))
+            im = np.where(valid, np.clip(im * gain + bias, 1, 255), 0).astype(np.uint8)
+            img = np.concatenate([im, img[n:]])
+        x = torch.from_numpy(np.ascontiguousarray(M.normalize(img)))
+        y = torch.from_numpy(np.ascontiguousarray(mask).astype(np.int64))
+        return x, y
+
+
+def n_image_bands(descriptions) -> int:
+    """Image bands come first; context bands are named ctx:<source>:<layer>."""
+    return sum(1 for d in descriptions if not (d or "").startswith("ctx:"))
+
+
+def _seed_worker(_):
+    """Each DataLoader worker would otherwise start numpy from the same state and repeat augmentations."""
+    np.random.seed(torch.initial_seed() % 2**32)
+
+
+def dice_loss(logits, target, classes=(1, 2)):
+    valid = target != IGNORE
+    prob = logits.softmax(1)
+    loss = 0.0
+    for c in classes:
+        p = prob[:, c][valid]
+        t = (target[valid] == c).float()
+        loss = loss + 1 - (2 * (p * t).sum() + 1) / (p.sum() + t.sum() + 1)
+    return loss / len(classes)
+
+
+def confusion(logits, target, n=3):
+    pred = logits.argmax(1)
+    valid = target != IGNORE
+    idx = target[valid] * n + pred[valid]
+    return torch.bincount(idx, minlength=n * n).reshape(n, n).cpu().numpy()
 
 
 def iou_from_confusion(cm):
-    tp = np.diag(cm).astype(float)
-    denom = cm.sum(0) + cm.sum(1) - np.diag(cm)
-    return np.where(denom > 0, tp / np.maximum(denom, 1), np.nan)
+    inter = np.diag(cm)
+    union = cm.sum(0) + cm.sum(1) - inter
+    return inter / np.maximum(union, 1)
 
 
-def _evaluate(model, loader, loss_fn, device):
-    import torch
+def train(cfg, tiles_dir: Path | None = None, out_dir: Path | None = None, epochs: int | None = None,
+          resume: bool = True, limit: int | None = None) -> Path:
+    tiles_dir = Path(tiles_dir or cfg.paths.tiles)
+    out_dir = Path(out_dir or cfg.paths.models)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index = pd.read_csv(tiles_dir / "index.csv")
+    tr_ids = index[index.split == "train"].id.tolist()
+    va_ids = index[index.split == "val"].id.tolist() or index[index.split == "test"].id.tolist()
+    if limit:
+        tr_ids, va_ids = tr_ids[:limit], va_ids[:max(1, limit // 4)]
+    if not tr_ids or not va_ids:
+        raise ValueError(f"need train and val chips, got {len(tr_ids)} / {len(va_ids)}")
+    with rasterio.open(tiles_dir / "images" / f"{tr_ids[0]}.tif") as s:
+        in_ch, gsd, bands = s.count, s.transform.a, list(s.descriptions)
 
-    model.eval()
-    cm, total, n = np.zeros((3, 3), np.int64), 0.0, 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            total += loss_fn(logits, y).item() * len(x)
-            n += len(x)
-            cm += confusion(logits.argmax(1).cpu().numpy(), y.cpu().numpy())
-    iou = iou_from_confusion(cm)
-    return {"val_loss": total / max(n, 1), "iou_bg": iou[0], "iou_interior": iou[1], "iou_boundary": iou[2],
-            "score": float(np.nanmean(iou[1:]))}
-
-
-def _check_scenes_compatible(scenes):
-    import rasterio
-
-    info = []
-    for s in scenes:
-        with rasterio.open(s["imagery"]) as r:
-            info.append((s["name"], r.count, abs(r.transform.a)))
-    n0, c0, r0 = info[0]
-    for n, c, r in info[1:]:
-        if c != c0 or abs(r - r0) / r0 > 0.01:
-            raise ValueError(
-                f"Scene '{n}' ({c} bands, {r:g} m pixels) does not match '{n0}' ({c0} bands, {r0:g} m). "
-                "One model needs one kind of imagery. Keep each imagery type in its own project folder "
-                "(copy config.yaml and use --config), or move the odd scene out of data/imagery/.")
-
-
-def train(cfg, scenes=None, init_checkpoint=None, epochs=None, out_checkpoint=None, progress=print):
-    """Train from scratch, or fine-tune from `init_checkpoint` (retraining on new/corrected labels).
-
-    `scenes` = list of {"name", "imagery", "labels"}; default: every scene in data/imagery that has labels.
-
-    Returns {"checkpoint", "history", "best"}. The best epoch (by mean IoU of interior+boundary on
-    validation blocks) is saved to cfg.model.checkpoint (or `out_checkpoint`).
-    """
-    import segmentation_models_pytorch as smp
-    import torch
-    from torch.utils.data import DataLoader
-
-    from .pipeline import list_scenes
-
+    dev = M.device()
     tc = cfg.train
-    scenes = scenes or list_scenes(cfg)
-    if not scenes:
-        raise RuntimeError("No scenes with labels found. Run the `fetch` and `labels` steps first.")
-    _check_scenes_compatible(scenes)
-    out_ckpt = Path(out_checkpoint or cfg.path(cfg.model.checkpoint))
-    epochs = epochs or tc.epochs
-    random.seed(tc.seed), np.random.seed(tc.seed), torch.manual_seed(tc.seed)
-    device = pick_device(tc.device)
+    epochs = int(epochs or tc.epochs)
+    # same seed -> same initial weights and chip order, so experiments differ only in their labels
+    seed = int(tc.get("seed", 42))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    net = M.build(cfg.model.arch, cfg.model.encoder, in_ch, cfg.model.get("encoder_weights")).to(dev)
+    opt = torch.optim.AdamW(net.parameters(), lr=float(tc.lr), weight_decay=float(tc.weight_decay))
+    use_amp = bool(tc.amp) and dev == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    weights = torch.tensor(tc.class_weights, dtype=torch.float32, device=dev)
 
-    if init_checkpoint:
-        model, norm, _ = load_checkpoint(init_checkpoint, device)
-        lr = tc.finetune_lr
-        progress(f"Fine-tuning from {init_checkpoint} (lr={lr})")
-    else:
-        norm = ensure_norm(cfg, scenes[0]["imagery"])
-        model = build_model(cfg.model.encoder, n_channels(norm), cfg.model.encoder_weights).to(device)
-        lr = tc.lr
-    model.train()
+    nw = int(tc.num_workers)
+    tr = DataLoader(ChipDataset(tiles_dir, tr_ids, True), batch_size=int(tc.batch_size), shuffle=True,
+                    num_workers=nw, pin_memory=dev == "cuda", drop_last=len(tr_ids) > int(tc.batch_size),
+                    generator=torch.Generator().manual_seed(seed), worker_init_fn=_seed_worker)
+    va = DataLoader(ChipDataset(tiles_dir, va_ids, False), batch_size=int(tc.batch_size), num_workers=nw)
+    steps_total = epochs * len(tr)
+    warmup = min(500, max(1, steps_total // 20))
 
-    split = load_or_create_split(cfg, scenes, progress)
-    ok = lambda b: b["w"] >= tc.crop_px and b["h"] >= tc.crop_px  # noqa: E731
-    train_b = [b for b in split_blocks(split, "train") if ok(b)]
-    val_b = [b for b in split_blocks(split, "val") if ok(b)]
-    if not train_b:
-        raise RuntimeError("No usable training blocks. Is the labelled area large enough "
-                           "(try a larger imagery.bbox or smaller split.block_px)?")
-    progress(f"Blocks: train={len(train_b)} val={len(val_b)} test={len(split_blocks(split, 'test'))}; device={device}")
+    def lr_at(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, steps_total - warmup)))
 
-    ds_tr = CropDataset(scenes, norm, train_b, tc.crop_px,
-                        epochs * tc.steps_per_epoch * tc.batch_size, train=True, seed=tc.seed)
-    ds_va = CropDataset(scenes, norm, val_b or train_b, tc.crop_px, tc.val_crops, train=False, seed=tc.seed)
-    loader_va = DataLoader(ds_va, batch_size=tc.batch_size, num_workers=tc.num_workers)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
+    meta = {"arch": cfg.model.arch, "encoder": cfg.model.encoder, "in_channels": in_ch, "bands": bands,
+            "image_bands": n_image_bands(bands), "context_bands": [b for b in bands if (b or "").startswith("ctx:")],
+            "gsd_m": gsd, "classes": ["background", "interior", "boundary"], "config": to_plain(cfg)}
 
-    weights = torch.tensor(tc.class_weights, dtype=torch.float32, device=device)
-    ce = torch.nn.CrossEntropyLoss(weight=weights, ignore_index=IGNORE)
-    dice = smp.losses.DiceLoss("multiclass", ignore_index=IGNORE)
-    loss_fn = lambda logits, y: ce(logits, y) + 0.5 * dice(logits, y)  # noqa: E731
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=tc.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    start, best, history = 0, -1.0, []
+    last = out_dir / "last.pt"
+    if resume and last.exists():
+        ck = torch.load(last, map_location=dev)
+        net.load_state_dict(ck["state_dict"])
+        opt.load_state_dict(ck["optimizer"])
+        sched.load_state_dict(ck["scheduler"])
+        start, best, history = ck["epoch"] + 1, ck["best"], ck["history"]
+        print(f"Resuming from epoch {start} (best val mIoU {best:.3f})")
 
-    history, best, stale = [], {"score": -1.0}, 0
-    log_path = out_ckpt.with_suffix(".history.csv")
-    out_ckpt.parent.mkdir(parents=True, exist_ok=True)
-    per_epoch = tc.steps_per_epoch * tc.batch_size
-    for epoch in range(1, epochs + 1):
+    print(f"device={dev} train={len(tr_ids)} val={len(va_ids)} chips, {in_ch} bands {bands}, gsd {gsd} m")
+    for epoch in range(start, epochs):
         t0 = time.time()
-        model.train()
-        sub = torch.utils.data.Subset(ds_tr, range((epoch - 1) * per_epoch, epoch * per_epoch))
-        loader = DataLoader(sub, batch_size=tc.batch_size, shuffle=False, num_workers=tc.num_workers)
-        run, nb = 0.0, 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            loss = loss_fn(model(x), y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        net.train()
+        run = 0.0
+        for x, y in tr:
+            x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+            with torch.autocast("cuda", enabled=use_amp):
+                logits = net(x)
+                loss = F.cross_entropy(logits, y, weight=weights, ignore_index=IGNORE)
+            loss = loss + float(tc.dice_weight) * dice_loss(logits.float(), y)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
             run += loss.item()
-            nb += 1
-        sched.step()
-        m = _evaluate(model, loader_va, loss_fn, device)
-        row = {"epoch": epoch, "train_loss": run / max(nb, 1), **m, "seconds": round(time.time() - t0, 1)}
+        net.eval()
+        cm = np.zeros((3, 3), dtype=np.int64)
+        vloss = 0.0
+        with torch.no_grad():
+            for x, y in va:
+                x, y = x.to(dev), y.to(dev)
+                with torch.autocast("cuda", enabled=use_amp):
+                    logits = net(x)
+                vloss += F.cross_entropy(logits.float(), y, weight=weights, ignore_index=IGNORE).item()
+                cm += confusion(logits, y)
+        iou = iou_from_confusion(cm)
+        miou = float(iou[1:].mean())
+        row = {"epoch": epoch, "train_loss": run / len(tr), "val_loss": vloss / len(va), "iou_bg": iou[0],
+               "iou_interior": iou[1], "iou_boundary": iou[2], "val_miou": miou,
+               "lr": opt.param_groups[0]["lr"], "minutes": (time.time() - t0) / 60}
         history.append(row)
-        progress(f"epoch {epoch:02d}/{epochs} train_loss={row['train_loss']:.3f} val_loss={m['val_loss']:.3f} "
-                 f"IoU interior={m['iou_interior']:.3f} boundary={m['iou_boundary']:.3f} ({row['seconds']}s)")
-        if m["score"] > best["score"]:
-            best, stale = {**row}, 0
-            save_checkpoint(out_ckpt, model, cfg, norm, epoch, {k: float(v) for k, v in m.items()})
-        else:
-            stale += 1
-        with open(log_path, "w", newline="") as f:
+        print("epoch {epoch:3d}  loss {train_loss:.3f}/{val_loss:.3f}  IoU interior {iou_interior:.3f} "
+              "boundary {iou_boundary:.3f}  ({minutes:.1f} min)".format(**row))
+        if miou > best:
+            best = miou
+            M.save(out_dir / "best.pt", net, {**meta, "epoch": epoch, "val": row})
+        torch.save({"state_dict": net.state_dict(), "optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
+                    "epoch": epoch, "best": best, "history": history, "meta": meta}, last)
+        with open(out_dir / "history.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(history[0]))
             w.writeheader()
             w.writerows(history)
-        if stale >= tc.patience:
-            progress(f"Early stop: no improvement for {tc.patience} epochs.")
-            break
-    return {"checkpoint": out_ckpt, "history": history, "best": best, "history_csv": log_path}
+    print(f"Best val mIoU (interior+boundary) {best:.3f} -> {out_dir / 'best.pt'}")
+    return out_dir / "best.pt"
