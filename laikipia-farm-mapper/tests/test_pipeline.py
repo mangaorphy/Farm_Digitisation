@@ -203,3 +203,17 @@ def test_config_base_inheritance():
     assert cfg.imagery.gsd_m == 4.77 and cfg.tiles.size_px == 256
     assert cfg.labels.keep.QA_FLAG == ["OK"]          # inherited from config.yaml
     assert cfg.paths.tiles.name == "tiles_nicfi" and cfg.paths.labels.name == "manual"
+
+
+def test_infer_chunk_smaller_than_tile():
+    """Edge chunks narrower than one tile (e.g. 192 px with 256 px tiles) are padded, predicted and cropped."""
+    import torch
+    net = torch.nn.Conv2d(4, 3, 1).eval()
+    seen = []
+    net.register_forward_hook(lambda m, i, o: seen.append(tuple(i[0].shape[-2:])))
+    for shape in [(256, 192), (100, 300), (50, 60)]:
+        img = np.random.default_rng(0).integers(1, 255, (4, *shape), dtype=np.uint8)
+        out = predict._infer_chunk(net, img, tile=256, overlap=64, batch=4, dev="cpu", n_image=4)
+        assert out.shape == (3, *shape)
+        assert np.allclose(out.sum(axis=0), 1, atol=1e-4)  # probabilities everywhere
+    assert set(seen) == {(256, 256)}  # the model only ever sees full tiles

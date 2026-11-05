@@ -24,6 +24,11 @@ def _weights(n: int) -> np.ndarray:
 
 def _infer_chunk(net, img: np.ndarray, tile: int, overlap: int, batch: int, dev: str, n_image: int) -> np.ndarray:
     C, H, W = img.shape
+    if H < tile or W < tile:
+        # an edge chunk narrower than one tile: pad with nodata (0) to a full tile, predict, crop back
+        padded = np.zeros((C, max(H, tile), max(W, tile)), img.dtype)
+        padded[:, :H, :W] = img
+        return _infer_chunk(net, padded, tile, overlap, batch, dev, n_image)[:, :H, :W]
     step = tile - overlap
     ys = list(range(0, max(H - tile, 0) + 1, step)) or [0]
     xs = list(range(0, max(W - tile, 0) + 1, step)) or [0]
