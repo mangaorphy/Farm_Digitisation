@@ -89,25 +89,40 @@ python -m farmmap tiles --config config_s2.yaml --set 'context.use=["dea","gee"]
 | E1 | image + DE Africa context |
 | E2 | image + DE Africa + Earth Engine context (only if you ran the `gee` step) |
 
-## Step 6: Train on Kaggle (GPU)
+## Step 6: Train, compare and map on Kaggle (GPU), in one run
 
-1. Zip a tiles folder, for example `data/tiles_s2_E1`, and upload it to Kaggle as a **private** dataset.
-2. Push the repo to GitHub, because the notebook clones it.
-3. Open `notebooks/kaggle_train.ipynb` and turn **GPU and Internet on**.
-4. In the config cell, set `CONFIG = "config_s2.yaml"`. Add the dataset, then **Save & Run All**.
-5. Download `best.pt` into a matching folder, for example `data/models_s2_E1/best.pt`.
+The notebook trains E0, E1 and E2 one after the other, scores each on the test blocks, picks the best and
+writes a KMZ of its farms.
 
-Repeat for E0 and E2.
+1. Zip the chips, then create **one private** Kaggle dataset named `laikipia-s2` holding:
+   - `data/tiles_s2_E0.zip`, `data/tiles_s2_E1.zip`, `data/tiles_s2_E2.zip`;
+   - `data/imagery/scenes_s2/S2_GEOMEDIAN_20250101_H1.tif`;
+   - `data/context/dea.tif` and `data/context/gee.tif`.
 
-## Step 7: Predict and score on the test blocks (laptop)
+   The notebook finds them by name anywhere in the dataset, and unpacks a zip if Kaggle did not.
+
+2. On Kaggle: *Code → New Notebook → File → Import Notebook*, and import `notebooks/kaggle_train.ipynb` (from
+   GitHub or as a file). *Settings → Accelerator → GPU*, *Internet → On*. *Add Input* → `laikipia-s2`.
+3. In **1. Settings** check `EXPERIMENTS` and `CONFIG = "config_s2.yaml"`. `MAP_AREA = "all"` (default) maps the
+   whole working area with the best model; `"test"` only the test blocks (faster).
+4. **Save Version → Save & Run All (commit)**. When it is done, open the version's *Output* and download:
+   - `best/farms_best_all.kmz`: the farms of the whole working area from the best model, for Google Earth Pro
+     (orange = review first); `best/farms_best_test.kmz`: the test blocks only;
+   - `comparison.csv`: F1, precision, recall and recall by farm size of every experiment;
+   - `models/E0/best.pt`, `models/E1/best.pt`, `models/E2/best.pt`: put them in `data/models_s2_E0/` etc.
+
+If a session ends early, run it again with the previous version's output attached as an input: finished
+experiments are skipped and the current one resumes.
+
+## Step 7: (Optional) Score on the laptop instead
 
 ```bash
 python -m farmmap run --config config_s2.yaml --split test --model data/models_s2_E1/best.pt --out outputs/s2/farms_E1.gpkg
 python -m farmmap evaluate --config config_s2.yaml --pred outputs/s2/farms_E1.gpkg
 ```
 
-Compare the F1 score and recall by farm size of E0, E1 and E2. Keep the simplest setup that scores within about
-0.02 F1 of the best.
+The notebook already does this for every experiment (`comparison.csv`); these commands repeat it on the laptop.
+Keep the simplest setup that scores within about 0.02 F1 of the best (the notebook picks it that way).
 
 Optional: drop predicted "farms" that are not cropland, without retraining:
 

@@ -13,6 +13,7 @@ __pycache__/
 laikipia-farm-mapper/data/imagery/
 laikipia-farm-mapper/data/tiles/
 laikipia-farm-mapper/data/tiles_*/
+laikipia-farm-mapper/data/*.zip
 laikipia-farm-mapper/data/models/
 laikipia-farm-mapper/data/models_*/
 laikipia-farm-mapper/data/context/
