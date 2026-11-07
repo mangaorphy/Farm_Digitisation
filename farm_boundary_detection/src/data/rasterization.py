@@ -255,6 +255,14 @@ def mask_validation_figure(cfg, info: RasterInfo, polys: gpd.GeoDataFrame, mask_
     from ..utils.helpers import rgb_indices
     from ..utils.visualization import plot_mask_validation
 
+    # only farms on usable pixels: a clipped scene has no data over many of the farms near it
+    t = polys[polys["train"]] if "train" in polys else polys
+    if len(t):
+        pts = t.geometry.representative_point()
+        with rasterio.open(Path(mask_dir) / "valid.tif") as v:
+            ok = np.array([s[0] for s in v.sample(list(zip(pts.x, pts.y)), masked=False)]) == 1
+        if ok.any():
+            polys = t[ok]
     win = densest_window(polys, info, int(cfg.masks.get("visual_px", 512)))
     bands = select_bands(info, cfg.imagery.get("bands"))
     rgb = rgb_indices(len(bands), [info.descriptions[b - 1] if info.descriptions else "" for b in bands],
