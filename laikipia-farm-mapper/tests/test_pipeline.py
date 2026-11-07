@@ -132,77 +132,12 @@ def test_new_farm_defaults_and_cli_set(tmp_path):
     cli.main(["labels", "--set", f"paths.labels={lab}", f"paths.aoi={tmp_path / 'none.geojson'}"])
 
 
-def _fake_context(cfg, path, layers=("crop_prob", "ndvi_h1")):
-    """A 10 m context file over the synthetic scene, as `farmmap context` would write it."""
-    from farmmap import context as CTX
-    from rasterio.transform import from_origin
-    with rasterio.open(cfg.paths.mosaic) as s:
-        L, B, R, T = s.bounds
-    gsd = 10.0
-    x0, y1 = np.floor(L / gsd) * gsd - 50, np.ceil(T / gsd) * gsd + 50
-    W, H = int((R - x0) / gsd) + 10, int((y1 - B) / gsd) + 10
-    yy, xx = np.mgrid[0:H, 0:W]
-    vals = {"crop_prob": 100.0 * xx / W, "ndvi_h1": np.full((H, W), 0.5)}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(path, "w", driver="GTiff", width=W, height=H, count=len(layers), dtype="uint8", nodata=0,
-                       crs=cfg.aoi.crs, transform=from_origin(x0, y1, gsd, gsd)) as d:
-        d.write(np.stack([CTX.encode(vals[k], k) for k in layers]))
-        d.descriptions = tuple(f"ctx:dea:{k}" for k in layers)
-    return path
-
-
-def test_context_encode_read_roundtrip(work, tmp_path):
-    from farmmap import context as CTX
-    v = np.array([-0.2, 0.0, 0.45, 0.9, np.nan])
-    back = CTX.decode(CTX.encode(v, "ndvi_h1"), "ndvi_h1")
-    assert np.allclose(back[:4], v[:4], atol=0.005) and np.isnan(back[4])
-    f = _fake_context(work, tmp_path / "ctx" / "dea.tif")
-    with rasterio.open(work.paths.mosaic) as s:
-        t = s.transform
-    arr = CTX.read([f], work.aoi.crs, t, (64, 64))
-    assert arr.shape == (2, 64, 64) and (arr > 0).all()
-    assert abs(CTX.decode(arr[1], "ndvi_h1").mean() - 0.5) < 0.01
-
-
-def test_pipeline_with_context_bands(work, tmp_path):
-    """Context bands become extra chip channels, the model records them, predict re-attaches them,
-    and a different context.use is refused."""
-    from farmmap import config as C
-    _fake_context(work, tmp_path / "ctx" / "dea.tif")
-    cfg = C.Cfg(work)
-    cfg.paths = C.Cfg({**work.paths, "context": tmp_path / "ctx", "tiles": tmp_path / "tiles",
-                       "models": tmp_path / "models", "outputs": tmp_path / "out"})
-    cfg.context = C.Cfg({**work.context, "use": ["dea"]})
-    idx = tiles.make_tiles(cfg)
-    with rasterio.open(Path(cfg.paths.tiles) / "images" / f"{idx.id[0]}.tif") as s:
-        assert s.count == 6 and s.descriptions[4:] == ("ctx:dea:crop_prob", "ctx:dea:ndvi_h1")
-        assert (s.read()[4:] > 0).all()
-    best = train.train(cfg, epochs=1)
-    import torch
-    meta = torch.load(best, map_location="cpu")["meta"]
-    assert meta["in_channels"] == 6 and meta["image_bands"] == 4 and len(meta["context_bands"]) == 2
-    prob = predict.predict(cfg, best)
-    with rasterio.open(prob) as s:
-        assert s.count == 3 and (s.read(1) > 0).mean() > 0.9
-    # predict takes the context sources from the model, not from context.use
-    cfg.context = C.Cfg({**work.context, "use": []})
-    predict.predict(cfg, best, out_path=tmp_path / "p2.tif")
-    _fake_context(work, tmp_path / "ctx" / "dea.tif", layers=("crop_prob",))  # a different stack is refused
-    with pytest.raises(ValueError, match="context bands"):
-        predict.predict(cfg, best, out_path=tmp_path / "p3.tif")
-    _fake_context(work, tmp_path / "ctx" / "dea.tif")
-    # optional post-filter: crop_prob rises west->east, so a high minimum drops the western farms
-    cfg.polygonize = C.Cfg({**work.polygonize, "context_filter": {"band": "ctx:dea:crop_prob", "min": 50}})
-    farms = polygonize.polygonize(cfg, prob, tmp_path / "out" / "f.gpkg")
-    if len(farms):
-        assert (farms.ctx_value >= 50).all()
-
-
-def test_config_base_inheritance():
-    cfg = config.load(ROOT / "config_nicfi.yaml")
-    assert cfg.imagery.gsd_m == 4.77 and cfg.tiles.size_px == 256
+def test_config_base_inheritance(tmp_path):
+    child = tmp_path / "child.yaml"
+    child.write_text(f"base: {ROOT / 'config.yaml'}\nimagery:\n  gsd_m: 3\ntiles:\n  size_px: 256\n")
+    cfg = config.load(child)
+    assert cfg.imagery.gsd_m == 3 and cfg.tiles.size_px == 256
     assert cfg.labels.keep.QA_FLAG == ["OK"]          # inherited from config.yaml
-    assert cfg.paths.tiles.name == "tiles_nicfi" and cfg.paths.labels.name == "manual"
 
 
 def test_infer_chunk_smaller_than_tile():

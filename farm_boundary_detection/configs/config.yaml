@@ -1,0 +1,183 @@
+# Farm boundary detection from PlanetScope (3 m) imagery and Google Earth Pro farm polygons.
+# Paths are relative to the project folder (the parent of configs/). Any value can be overridden on the
+# command line after the command, e.g.:  python -m src train --set train.batch_size=4 train.epochs=50
+
+project:
+  seed: 42
+  log_level: INFO
+
+paths:
+  imagery_dir: data/imagery/raw          # PlanetScope GeoTIFFs (any sub-folders); UDM2 files next to them are used
+  labels_dir: data/labels                # KML / KMZ (also GPKG / SHP / GeoJSON) farm polygons
+  aoi: data/aoi/training_aoi.geojson     # written by `python -m src aoi`; used to order imagery
+  complete_areas: null                   # optional polygons where EVERY farm is digitised (see masks.label_region)
+  processed_dir: processed_data
+  models_dir: models
+  outputs_dir: outputs
+  logs_dir: logs
+
+# ---------------------------------------------------------------- imagery
+imagery:
+  include: ["*.tif", "*.tiff", "*.TIF", "*.TIFF"]
+  exclude: ["*udm*", "*UDM*", "*_DN_*", "*metadata*"]   # UDM2 masks are found separately
+  bands: null                 # null = all bands; or 1-based band numbers to use, e.g. [2, 4, 6, 8]
+  rgb_bands: null             # 1-based [R, G, B] among the SELECTED bands; null = auto (4-band BGRN / 8-band SuperDove)
+  nodata: null                # null = the file's nodata value, else 0 (Planet SR uses 0)
+  use_udm2: true              # pixels that UDM2 does not mark "clear" are treated as nodata
+  require_projected_crs: true # boundary widths are in metres; Planet ortho products are UTM
+
+# ---------------------------------------------------------------- labels
+labels:
+  id_field: FARM_ID           # attribute holding the farm id (falls back to the placemark name, then a counter)
+  defaults:                   # filled in where the attribute is missing/empty (e.g. "New farms" polygons)
+    QA_FLAG: OK
+    SOURCE: Digitized
+  keep:                       # polygons NOT matching are real farms of doubtful quality: their pixels are IGNORED
+    QA_FLAG: [OK]             # (excluded from loss and metrics), never treated as background
+  drop: {}                    # e.g. {SCHEME: ["Thome Outspan"]}: also ignored
+  min_area_m2: 100            # smaller polygons are digitising errors at 3 m (about 11 pixels)
+  duplicate_iou: 0.95         # two polygons overlapping more than this are one farm digitised twice
+  assume_crs: EPSG:4326       # CRS for vector files that carry none (KML is always EPSG:4326)
+
+# ---------------------------------------------------------------- AOI for ordering imagery
+aoi:
+  buffer_m: 500               # around the kept (training) farms
+  simplify_m: 100
+  min_part_km2: 0.5           # drop tiny isolated parts
+  max_vertices: 1400          # Planet's clip tool limit is 1500 vertices
+
+# ---------------------------------------------------------------- Planet ordering (Education & Research plan)
+planet:
+  env_file: ../.env           # api_key=... (or set PL_API_KEY in the environment)
+  item_type: PSScene
+  asset: ortho_analytic_8b_sr # the asset that must be downloadable
+  product_bundle: analytic_8b_sr_udm2
+  date_start: "2026-05-01"
+  date_end: "2026-09-30"      # E&R access lags behind real time: the newest ~month is not downloadable
+  max_cloud_cover: 0.05
+  min_clear_percent: 90
+  coverage_target: 0.98       # stop adding scenes once this share of the AOI is covered
+  max_scenes: 60
+  max_order_km2: 2500         # refuse orders above this (monthly quota is 3,000 km2 of clipped area)
+  harmonize: false            # Planet's harmonize tool (PSScene -> Sentinel-2 radiometry); off by default
+
+# ---------------------------------------------------------------- target masks
+masks:
+  boundary_width_m: 3.0       # TOTAL width of the boundary band. Buffer RADIUS = boundary_width_m / 2.
+                              # 3 m = 1 pixel at 3 m GSD, 6 m = 2 pixels.
+  boundary_mode: auto         # auto: "line" if the width is <= 1 pixel, else "buffer"
+                              # line   = rasterise the polygon outlines themselves (all_touched): a continuous
+                              #          1-pixel line, the thinnest that never has gaps
+                              # buffer = rasterise outline.buffer(radius) at pixel centres
+  include_holes: true         # interior rings (holes) also get a boundary
+  label_region: buffer        # where background (0) is trusted:
+                              #  buffer = within label_region_buffer_m of any digitised farm (your files do not
+                              #           cover every farm, so far from mapped farms "no polygon" means "unknown")
+                              #  all    = everywhere in the image (only if every farm in the image is digitised)
+                              # paths.complete_areas, if given, is always added to the trusted region
+  label_region_buffer_m: 60
+  ignore_buffer_m: 3          # margin around ignored (QA-flagged) polygons that is also ignored
+  block_px: 2048              # masks are written in blocks of this size (memory)
+  visual_px: 512              # size of the validation figure crop
+
+# ---------------------------------------------------------------- geographic split (before patching)
+split:
+  crs: null                   # projected CRS of the split grid; null = UTM zone of the labels
+  block_size_m: 6000          # the grid is shared by all images, so one place is in one split only
+  fractions: {train: 0.70, val: 0.15, test: 0.15}
+  seed: 42
+
+# ---------------------------------------------------------------- patches
+patches:
+  size: 512
+  stride: 256                 # training patches overlap (stride < size)
+  eval_stride: 512            # validation / test patches do not overlap
+  min_farm_pixels: 400        # a "farm" patch needs at least this many labelled farm pixels
+  min_valid_fraction: 0.15    # ...and this share of pixels usable for the loss
+  max_nodata_fraction: 0.5
+  background_keep_fraction: 0.15  # share of background-only candidate patches that is kept
+  overwrite: true             # clear previous patches of the same output folder first
+
+normalization:
+  clip_percentiles: [1, 99]   # per band, from training patches; values are clipped, then z-scored
+  sample_patches: 300
+
+augmentation:
+  hflip: 0.5
+  vflip: 0.5
+  rot90: true
+  rotate_prob: 0.0            # arbitrary-angle rotation; off by default because nearest-neighbour rotation
+  rotate_max_deg: 30          # of 1-pixel boundaries leaves gaps
+  brightness: 0.10            # additive, in standard deviations
+  contrast: 0.10              # multiplicative
+  noise_std: 0.03
+
+# ---------------------------------------------------------------- model
+model:
+  encoder: resnet34           # resnet18 / resnet34 / resnet50 / resnet101 (torchvision)
+  pretrained: true            # ImageNet weights; the first conv is adapted to the number of bands
+  decoder_channels: [256, 128, 64, 32]
+  full_resolution_branch: true  # extra full-resolution features: ResNet's stride-2 stem would blur 1-px boundaries
+  psp_pooling: true           # pyramid scene pooling at the bridge (as in ResUNet-a)
+  condition_interior_on_boundary: true  # interior head also sees the boundary prediction (conditioned multitasking)
+  dropout: 0.1
+
+# ---------------------------------------------------------------- loss
+loss:
+  lambda_interior: 1.0
+  lambda_boundary: 2.0        # boundary pixels are rare: weighted higher
+  interior: {bce: 1.0, dice: 1.0}
+  boundary: {bce: 1.0, dice: 1.0, tversky: 0.5, focal: 0.0}
+  boundary_pos_weight: 4.0    # BCE weight of boundary-positive pixels
+  tversky_alpha: 0.3          # false positives
+  tversky_beta: 0.7           # false negatives (missed boundary = merged farms: penalised more)
+  focal_gamma: 2.0
+  boundary_aware:             # interior BCE pixel weight w = 1 + w0 * exp(-d^2 / (2 sigma^2)),
+    w0: 4.0                   # d = distance (px) to the nearest true boundary: learning to stop exactly at
+    sigma_px: 2.0             # a farm edge matters most for separating neighbours
+
+# ---------------------------------------------------------------- training
+train:
+  epochs: 100
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  lr: 0.0003
+  weight_decay: 0.0001
+  scheduler: cosine           # cosine (with warmup) or plateau
+  warmup_epochs: 2
+  patience: 15                # early stopping on the monitored metric (null = off)
+  min_delta: 0.002
+  grad_clip: 1.0
+  amp: true                   # mixed precision on CUDA
+  monitor: val_score          # = mean of interior IoU and boundary F1 (tolerance) on validation
+  boundary_tolerance_px: 1    # a predicted boundary pixel within this distance of a true one counts as correct
+  run_checks: true            # run the pre-training validation checks first
+  deterministic: false        # true = reproducible to the bit, but slower on GPU
+  max_train_patches: null     # for quick tests
+
+# ---------------------------------------------------------------- evaluation
+evaluation:
+  threshold: 0.5
+  instance_iou: 0.5           # object-level match: one farm = one predicted region with IoU >= this
+  n_visuals: 12
+
+# ---------------------------------------------------------------- inference
+inference:
+  patch_size: 512
+  overlap: 128
+  chunk_px: 2048              # the scene is processed in chunks of this size (memory)
+  batch_size: 8
+  tta: false                  # average over flips (4x slower, slightly smoother)
+
+# ---------------------------------------------------------------- polygon reconstruction
+postprocess:
+  interior_threshold: 0.5     # extent: P(interior) above this
+  seed_threshold: 0.5         # seeds: P(interior) * (1 - P(boundary)) above this
+  boundary_threshold: 0.5     # seeds never include pixels with P(boundary) above this
+  min_seed_px: 15             # smaller seeds would split one farm into several
+  min_area_m2: 900            # 0.09 ha = 100 pixels
+  hole_area_m2: 900
+  simplify_m: 1.5             # half a pixel
+  block_px: 4096
+  halo_px: 512                # farms larger than ~halo x 3 m may be cut by a block edge, then merged

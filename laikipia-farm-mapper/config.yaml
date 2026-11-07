@@ -7,7 +7,6 @@ paths:
   imagery_raw: data/imagery/raw       # put the SDX downloads here, unchanged (GeoTIFF / NITF, any sub-folders)
   scenes: data/imagery/scenes         # ingest writes one aligned, 8-bit GeoTIFF per scene here
   mosaic: data/imagery/mosaic.vrt     # ...and a VRT that stitches them (newest scene on top)
-  context: data/context               # 10 m context layers: dea.tif (Digital Earth Africa), gee.tif (Earth Engine)
   tiles: data/tiles                   # training chips + masks (zip this folder for Kaggle)
   models: data/models
   outputs: outputs
@@ -34,7 +33,7 @@ labels:
     QA_FLAG: [OK]
     SOURCE: [Digitized, Scheme layer]  # use [Digitized] if `check` shows the scheme layer is misregistered
   # Groups taken out of training (also become "ignore" pixels), e.g. schemes `check` calls SHIFTED/UNCLEAR.
-  # Values must match the CSV exactly. The 5 below are the ones the Sentinel-2 check flagged (118 parcels).
+  # Values must match the CSV exactly. The 5 below were flagged by an earlier registration check (118 parcels).
   drop:
     SCHEME: ["G.L.(Rumuruti Forest", "G.L.(Rware)", "Maundu ni meri Outspan", "Ndindika SFT", "Thome Outspan"]
   # Polygons drawn in the "New farms" folder have no SOURCE/QA_FLAG; they get these values
@@ -58,24 +57,6 @@ imagery:
   dem: null                           # optional DEM GeoTIFF for RPC orthorectification (better on slopes)
   stretch_percentiles: [1, 99]        # per-scene contrast stretch to 8 bit (0 is reserved for nodata)
   newest_on_top: true
-
-# Context layers: free 10 m multi-date data stacked onto every chip as extra bands (see farmmap/context.py).
-# Build with `python -m farmmap context --sources dea gee`; `use` decides what the model sees, so experiments
-# differ only in this list. [] = image only. Prediction re-attaches whatever the model was trained with.
-context:
-  use: []                             # e.g. [dea] or [dea, gee]
-  year: 2025                          # season to describe: the year of your Legion scenes
-  gsd_m: 10
-  dea_block_px: 1024
-  gee:
-    embedding_components: 6           # AlphaEarth 64-D embedding -> this many principal components
-    pca_sample_blocks: 40
-    block_px: 512                     # 512 x 512 x 64 int8 = 16 MB per request (Earth Engine limit 48 MB)
-    nicfi_months: []                  # e.g. ["2025-02", "2025-08"]: dry and wet season NDVI (NICFI sign-up needed)
-
-# Earth Engine account (only for `context --sources gee` and `nicfi`): your Google Cloud project id
-gee:
-  project: null
 
 tiles:
   size_px: 512                        # 256 m at 0.5 m
@@ -118,7 +99,6 @@ polygonize:
   simplify_m: 0.75
   block_px: 4096
   halo_px: 1024                       # farms bigger than about halo x gsd may be split, then merged across blocks
-  context_filter: null                # e.g. {band: "ctx:dea:crop_prob", min: 10}: drop farms that are not cropland
 
 evaluate:
   iou_match: 0.5

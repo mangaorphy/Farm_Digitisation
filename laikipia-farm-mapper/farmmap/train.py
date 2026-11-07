@@ -27,8 +27,6 @@ IGNORE = 255
 class ChipDataset(Dataset):
     def __init__(self, tiles_dir: Path, ids: list[str], augment: bool):
         self.dir, self.ids, self.augment = Path(tiles_dir), list(ids), augment
-        with rasterio.open(self.dir / "images" / f"{self.ids[0]}.tif") as s:
-            self.n_image = n_image_bands(s.descriptions)
 
     def __len__(self):
         return len(self.ids)
@@ -44,23 +42,14 @@ class ChipDataset(Dataset):
             img, mask = np.rot90(img, k, axes=(1, 2)), np.rot90(mask, k)
             if np.random.rand() < 0.5:
                 img, mask = img[:, :, ::-1], mask[:, ::-1]
-            # per-band brightness/contrast jitter on the image bands only (scenes differ in sun angle and haze);
-            # context bands have fixed physical scales and are left alone
-            n = self.n_image
-            im = img[:n]
-            valid = im > 0
+            # per-band brightness/contrast jitter (scenes differ in sun angle and haze)
+            n = img.shape[0]
             gain = np.random.uniform(0.85, 1.15, (n, 1, 1))
             bias = np.random.uniform(-12, 12, (n, 1, 1))
-            im = np.where(valid, np.clip(im * gain + bias, 1, 255), 0).astype(np.uint8)
-            img = np.concatenate([im, img[n:]])
+            img = np.where(img > 0, np.clip(img * gain + bias, 1, 255), 0).astype(np.uint8)
         x = torch.from_numpy(np.ascontiguousarray(M.normalize(img)))
         y = torch.from_numpy(np.ascontiguousarray(mask).astype(np.int64))
         return x, y
-
-
-def n_image_bands(descriptions) -> int:
-    """Image bands come first; context bands are named ctx:<source>:<layer>."""
-    return sum(1 for d in descriptions if not (d or "").startswith("ctx:"))
 
 
 def _seed_worker(_):
@@ -135,7 +124,6 @@ def train(cfg, tiles_dir: Path | None = None, out_dir: Path | None = None, epoch
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     meta = {"arch": cfg.model.arch, "encoder": cfg.model.encoder, "in_channels": in_ch, "bands": bands,
-            "image_bands": n_image_bands(bands), "context_bands": [b for b in bands if (b or "").startswith("ctx:")],
             "gsd_m": gsd, "classes": ["background", "interior", "boundary"], "config": to_plain(cfg)}
 
     # early stopping: stop when val mIoU has not improved by min_delta for `patience` epochs (null = off)

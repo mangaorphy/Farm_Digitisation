@@ -1,0 +1,201 @@
+"""Task 4: PyTorch Dataset over the saved patches.
+
+Each item is a dict::
+
+    image          float32 (C, H, W)  normalised bands (any number: 4-band, 8-band PlanetScope...)
+    interior_mask  float32 (1, H, W)  0/1
+    boundary_mask  float32 (1, H, W)  0/1
+    valid_mask     float32 (1, H, W)  1 = pixel counts in loss and metrics (0 = nodata / cloud / ignored)
+    weight_map     float32 (1, H, W)  boundary-aware pixel weights for the interior loss
+    patch_id       str
+
+Normalisation (identical at inference): clip each band to the training percentiles, z-score with the training
+mean / std, then set nodata pixels to 0 (the mean). Spatial augmentations are applied identically to the image
+and all masks (nearest-neighbour for masks, so they stay binary); radiometric ones touch only valid image pixels.
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import rasterio
+import torch
+from scipy import ndimage as ndi
+from torch.utils.data import DataLoader, Dataset
+
+from ..utils.helpers import read_json, stable_seed
+
+log = logging.getLogger(__name__)
+
+
+class Normalizer:
+    """Band-wise clip + z-score with statistics from ``normalization.json``."""
+
+    def __init__(self, stats: dict):
+        self.stats = stats
+        self.lo = np.asarray(stats["clip_low"], np.float32)[:, None, None]
+        self.hi = np.asarray(stats["clip_high"], np.float32)[:, None, None]
+        self.mean = np.asarray(stats["mean"], np.float32)[:, None, None]
+        self.std = np.asarray(stats["std"], np.float32)[:, None, None]
+        self.nodata = stats.get("nodata", 0)
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "Normalizer":
+        return cls(read_json(path))
+
+    @property
+    def n_bands(self) -> int:
+        return int(self.mean.shape[0])
+
+    def data_mask(self, img: np.ndarray) -> np.ndarray:
+        """True where the pixel has data (not nodata in every band, and finite)."""
+        ok = ~np.all(img == self.nodata, axis=0) if self.nodata is not None else np.ones(img.shape[1:], bool)
+        return ok & np.all(np.isfinite(img), axis=0)
+
+    def __call__(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(C, H, W) raw -> (normalised float32, data mask)."""
+        if img.shape[0] != self.n_bands:
+            raise ValueError(f"image has {img.shape[0]} bands, normalisation expects {self.n_bands}")
+        ok = self.data_mask(img)
+        x = np.clip(np.nan_to_num(img.astype(np.float32)), self.lo, self.hi)
+        x = (x - self.mean) / self.std
+        x[:, ~ok] = 0.0
+        return x.astype(np.float32), ok
+
+
+def boundary_weight_map(boundary: np.ndarray, w0: float, sigma_px: float) -> np.ndarray:
+    """w = 1 + w0 * exp(-d^2 / (2 sigma^2)), d = distance (px) to the nearest boundary pixel.
+
+    Up-weights the interior/background pixels next to farm edges, where neighbouring farms touch and the
+    model must learn to stop exactly at the boundary (cf. the U-Net separation weights of Ronneberger 2015).
+    """
+    if w0 <= 0 or not boundary.any():
+        return np.ones(boundary.shape, np.float32)
+    d = ndi.distance_transform_edt(boundary == 0)
+    return (1.0 + w0 * np.exp(-(d ** 2) / (2.0 * sigma_px ** 2))).astype(np.float32)
+
+
+class FarmPatchDataset(Dataset):
+    """Patches of one split. ``augment`` = training augmentations (config ``augmentation``)."""
+
+    def __init__(self, processed_dir: str | Path, patch_ids: list[str], normalizer: Normalizer,
+                 augment: dict | None = None, boundary_aware: dict | None = None, seed: int = 0):
+        self.dir = Path(processed_dir)
+        self.ids = list(patch_ids)
+        if not self.ids:
+            raise ValueError("FarmPatchDataset needs at least one patch")
+        self.norm = normalizer
+        self.aug = augment
+        self.ba = boundary_aware or {}
+        self.seed = seed
+        missing = [p for p in self.ids[:20] if not (self.dir / "images" / f"{p}.tif").exists()]
+        if missing:
+            raise FileNotFoundError(f"patch files missing in {self.dir}/images, e.g. {missing[:3]}")
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _read(self, sub: str, pid: str) -> np.ndarray:
+        with rasterio.open(self.dir / sub / f"{pid}.tif") as s:
+            return s.read()
+
+    def load_raw(self, pid: str) -> dict[str, np.ndarray]:
+        return {"image": self._read("images", pid), "interior": self._read("interior_masks", pid)[0],
+                "boundary": self._read("boundary_masks", pid)[0], "valid": self._read("valid_masks", pid)[0]}
+
+    # ---------------------------------------------------------------- augmentation
+    @staticmethod
+    def _spatial(arrs: list[np.ndarray], rng: np.random.Generator, a: dict) -> list[np.ndarray]:
+        """Same flips / rotations for every array (image (C,H,W), masks (H,W))."""
+        def apply(fn):
+            return [fn(x) for x in arrs]
+        if a.get("rot90", True):
+            k = int(rng.integers(4))
+            arrs = apply(lambda x: np.rot90(x, k, axes=(-2, -1)))
+        if rng.random() < float(a.get("hflip", 0)):
+            arrs = apply(lambda x: x[..., :, ::-1])
+        if rng.random() < float(a.get("vflip", 0)):
+            arrs = apply(lambda x: x[..., ::-1, :])
+        if rng.random() < float(a.get("rotate_prob", 0)):
+            ang = float(rng.uniform(-a.get("rotate_max_deg", 30), a.get("rotate_max_deg", 30)))
+            img, *masks = arrs
+            img = ndi.rotate(img, ang, axes=(-1, -2), reshape=False, order=1, mode="constant", cval=0.0)
+            masks = [ndi.rotate(m, ang, axes=(-1, -2), reshape=False, order=0, mode="constant", cval=0) for m in masks]
+            arrs = [img, *masks]  # corners rotated in from outside have valid = 0
+        return [np.ascontiguousarray(x) for x in arrs]
+
+    @staticmethod
+    def _radiometric(x: np.ndarray, ok: np.ndarray, rng: np.random.Generator, a: dict) -> np.ndarray:
+        """Brightness / contrast / noise per band, on valid pixels only (x is already normalised)."""
+        c = x.shape[0]
+        b = rng.uniform(-a.get("brightness", 0), a.get("brightness", 0), (c, 1, 1)).astype(np.float32)
+        k = rng.uniform(1 - a.get("contrast", 0), 1 + a.get("contrast", 0), (c, 1, 1)).astype(np.float32)
+        y = x * k + b
+        if a.get("noise_std", 0):
+            y = y + rng.normal(0, a["noise_std"], x.shape).astype(np.float32)
+        return np.where(ok[None], y, 0.0).astype(np.float32)
+
+    def __getitem__(self, i: int) -> dict:
+        pid = self.ids[i]
+        raw = self.load_raw(pid)
+        x, ok = self.norm(raw["image"])
+        interior, boundary = raw["interior"].astype(np.uint8), raw["boundary"].astype(np.uint8)
+        valid = (raw["valid"].astype(bool) & ok).astype(np.uint8)
+        if self.aug:
+            rng = np.random.default_rng(stable_seed(self.seed, pid, torch.initial_seed(), np.random.randint(1 << 30)))
+            x, interior, boundary, valid, data = self._spatial(
+                [x, interior, boundary, valid, ok.astype(np.uint8)], rng, self.aug)
+            # image pixels outside the labelled region are still real context: augment every DATA pixel
+            x = self._radiometric(x, data.astype(bool), rng, self.aug)
+            valid = (valid.astype(bool) & data.astype(bool)).astype(np.uint8)
+        weight = boundary_weight_map(boundary, float(self.ba.get("w0", 0)), float(self.ba.get("sigma_px", 2.0)))
+        return {
+            "image": torch.from_numpy(x.astype(np.float32)),
+            "interior_mask": torch.from_numpy((interior > 0).astype(np.float32))[None],
+            "boundary_mask": torch.from_numpy((boundary > 0).astype(np.float32))[None],
+            "valid_mask": torch.from_numpy((valid > 0).astype(np.float32))[None],
+            "weight_map": torch.from_numpy(weight)[None],
+            "patch_id": pid,
+        }
+
+
+def load_patch_table(cfg) -> pd.DataFrame:
+    path = Path(cfg.paths.processed_dir) / "metadata" / "patches.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found: run `python -m src prepare` first")
+    return pd.read_csv(path)
+
+
+def _seed_worker(worker_id: int) -> None:
+    s = torch.initial_seed() % 2 ** 32
+    np.random.seed(s)
+
+
+def make_dataset(cfg, split: str, augment: bool | None = None, table: pd.DataFrame | None = None,
+                 limit: int | None = None) -> FarmPatchDataset:
+    table = table if table is not None else load_patch_table(cfg)
+    ids = table.loc[table["split"] == split, "patch_id"].tolist()
+    if limit:
+        ids = ids[: int(limit)]
+    if not ids:
+        raise ValueError(f"no {split} patches in {cfg.paths.processed_dir}/metadata/patches.csv")
+    norm = Normalizer.from_file(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
+    aug = dict(cfg.augmentation) if (augment if augment is not None else split == "train") else None
+    return FarmPatchDataset(cfg.paths.processed_dir, ids, norm, aug, dict(cfg.loss.get("boundary_aware") or {}),
+                            int(cfg.project.seed))
+
+
+def make_dataloader(cfg, split: str, shuffle: bool | None = None, augment: bool | None = None,
+                    limit: int | None = None, table: pd.DataFrame | None = None) -> DataLoader:
+    tc = cfg.train
+    ds = make_dataset(cfg, split, augment, table, limit)
+    shuffle = split == "train" if shuffle is None else shuffle
+    g = torch.Generator()
+    g.manual_seed(int(cfg.project.seed))
+    nw = int(tc.num_workers)
+    return DataLoader(ds, batch_size=int(tc.batch_size), shuffle=shuffle, num_workers=nw,
+                      pin_memory=bool(tc.pin_memory) and torch.cuda.is_available(),
+                      drop_last=shuffle and len(ds) > int(tc.batch_size), worker_init_fn=_seed_worker, generator=g,
+                      persistent_workers=nw > 0)

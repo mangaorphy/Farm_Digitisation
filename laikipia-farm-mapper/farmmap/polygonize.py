@@ -87,7 +87,6 @@ def polygonize(cfg, prob_path: Path, out_path: Path | None = None) -> gpd.GeoDat
     gdf["geometry"] = gdf.geometry.buffer(0).simplify(float(pc.simplify_m), preserve_topology=True)
     gdf["geometry"] = gdf.geometry.apply(lambda g: _fill_small_holes(g, float(pc.hole_area_m2)))
     gdf = gdf[gdf.area >= float(pc.min_area_m2)].copy()
-    gdf = context_filter(cfg, gdf)
     gdf = gdf.sort_values("score", ascending=False).reset_index(drop=True)
     gdf.insert(0, "farm_id", [f"AUTO-{i + 1:06d}" for i in range(len(gdf))])
     gdf["area_ha"] = (gdf.area / 1e4).round(3)
@@ -96,23 +95,6 @@ def polygonize(cfg, prob_path: Path, out_path: Path | None = None) -> gpd.GeoDat
     gdf.to_file(out_path, driver="GPKG", layer="farms")
     print(f"{len(gdf)} farm polygons -> {out_path}")
     return gdf
-
-
-def context_filter(cfg, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Optional: drop farms whose mean of a context band is below a minimum, e.g. not cropland at all.
-
-    polygonize.context_filter: {band: "ctx:dea:crop_prob", min: 10}   (physical units; null = off)
-    Farms with no context value (outside the context grid) are kept.
-    """
-    cf = cfg.polygonize.get("context_filter")
-    if not cf or gdf.empty:
-        return gdf
-    from . import context as CTX
-    source = cf["band"].split(":")[1]
-    vals = CTX.zonal_mean(gdf, [Path(cfg.paths.context) / f"{source}.tif"], cf["band"])
-    keep = ~(vals < float(cf["min"]))
-    print(f"context filter {cf['band']} >= {cf['min']}: dropped {int((~keep).sum())} of {len(gdf)} polygons")
-    return gdf.assign(ctx_value=np.round(vals, 3))[keep].copy()
 
 
 def _dedupe(recs: list[dict], overlap: float = 0.3) -> list[dict]:

@@ -5,7 +5,6 @@ exported as KMZ (Google Earth Pro) and GeoPackage (QGIS).
 
 ```
 SDX downloads (PAN + MS) ──ingest──► aligned 0.5 m RGB+NIR scenes + mosaic.vrt
-Digital Earth Africa / Earth Engine ──context──► 10 m multi-date layers (optional extra bands)
 your Earth Pro parcels (KMZ) ──check──► registration shifts per scheme
                                    │
                 tiles: chips + masks (background / interior / boundary / ignore)
@@ -15,8 +14,9 @@ your Earth Pro parcels (KMZ) ──check──► registration shifts per scheme
    predict ► probabilities ► polygonize (watershed) ► farms.gpkg / .kmz ► evaluate on test blocks
 ```
 
-Step-by-step run instructions: [RUN_STEPS.md](RUN_STEPS.md). **No SDX/Legion imagery?** That file runs the
-whole pipeline on a free 10 m Sentinel-2 composite (`python -m farmmap sentinel2`, `config_s2.yaml`).
+**Status (Nov 2026):** the Sentinel-2 / Digital Earth Africa / Earth Engine route was tried and dropped (the
+model could not separate farms at 10 m) and removed from the code. Next imagery source: **Planet** (to be added).
+The pipeline below (ingest → tiles → train → predict → polygonize → evaluate → KMZ) is imagery-agnostic.
 
 ## Read this first
 
@@ -57,7 +57,7 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -m farmmap demo              # synthetic end-to-end run, ~5 min on CPU: must end with "Demo OK"
-pytest -q                           # 11 tests, ~3 min
+pytest -q                           # 10 tests, ~3 min
 ```
 
 ## 3. Workflow
@@ -68,7 +68,6 @@ pytest -q                           # 11 tests, ~3 min
 | Working area + SDX boxes | laptop | `python -m farmmap aoi` | `data/aoi/` |
 | Ingest imagery | laptop | `python -m farmmap ingest` | `data/imagery/scenes/*.tif`, `mosaic.vrt` |
 | Registration check | laptop | `python -m farmmap check` | `outputs/registration_check.csv`, `registration_shifts.yaml` |
-| Context layers (optional) | laptop | `python -m farmmap context --sources dea gee` | `data/context/dea.tif`, `gee.tif` |
 | Training chips | laptop | `python -m farmmap tiles` | `data/tiles/` (zip it for Kaggle) |
 | Train | **Kaggle GPU** | `notebooks/kaggle_train.ipynb` | `best.pt`, `history.csv` |
 | Predict test blocks + polygons + KMZ | Kaggle or laptop | `python -m farmmap run --split test` | `outputs/farms_test.gpkg/.kmz` |
@@ -86,7 +85,7 @@ weak or inconsistent edges: exclude that scheme (`labels.keep.SCHEME`) or re-tra
 **Training on Kaggle.** Zip `data/tiles` → upload as a **private** dataset → push this repo to GitHub (the
 notebook clones it) → open `notebooks/kaggle_train.ipynb`, GPU and Internet on, add the dataset, **Save & Run
 All**. `last.pt` is saved every epoch; attach the output to a new version to resume. Download `best.pt` into
-`data/models/`. Step 8 of the notebook predicts on the GPU if you also upload the scenes (and `data/context/`).
+`data/models/`. Step 8 of the notebook predicts on the GPU if you also upload the scenes.
 
 **Output.** One polygon per farm with `farm_id` (AUTO-000001…), `area_ha` and `score` (mean interior
 probability). In the KMZ, green = confident, orange = score < 0.6 (review first).
@@ -105,64 +104,7 @@ Train each on Kaggle, then e.g. `python -m farmmap run --split test --model data
 outputs/farms_B.gpkg` and `python -m farmmap evaluate --pred outputs/farms_B.gpkg`. Compare F1 and
 `recall_by_size`. Parcels left out of training are *ignored* pixels, never background.
 
-## 5. Context layers: Digital Earth Africa and Google Earth Engine
-
-Neither source is sharper than Legion. What they add is **time**: one Legion image cannot tell a ploughed field
-from bare ground, or a crop from a grass paddock; a year of Sentinel-2 can. The 10 m layers are stacked onto
-every chip as extra bands.
-
-| Source | Layer | What it tells the model | Account |
-|---|---|---|---|
-| Digital Earth Africa (`dea`) | `crop_prob` | cropland probability (DE Africa crop mask, 2019) | none |
-| | `ndvi_h1`, `ndvi_h2` | greenness, Jan–Jun and Jul–Dec composites of `context.year` | |
-| | `bcmad` | change through the year: cultivated plots stand out | |
-| Earth Engine (`gee`) | `emb_pc1..6` | Google Satellite Embedding (AlphaEarth), 64-D → 6 principal components | Earth Engine |
-| | `dw_crops/trees/built/bare` | Dynamic World mean class probability (built = homesteads) | |
-| | `nicfi_ndvi_<month>` | Planet NICFI monthly NDVI, if `context.gee.nicfi_months` is set | NICFI sign-up |
-
-```powershell
-python -m farmmap context --sources dea          # open data, no login
-pip install earthengine-api; earthengine authenticate      # once
-python -m farmmap context --sources gee --set gee.project=YOUR-CLOUD-PROJECT
-```
-
-Interrupted runs resume. Set `context.year` to the year of your Legion scenes. `context.use` (`[]`, `[dea]`,
-`[dea, gee]`) picks what `tiles` stacks onto chips; the model records its context bands and `predict` re-attaches
-them automatically.
-
-**As a filter, no retraining:** `polygonize.context_filter: {band: "ctx:dea:crop_prob", min: 10}` drops predicted
-farms with mean cropland probability under 10 %. Check with `evaluate`; the 2019 crop mask misses some smallholdings.
-
-**NICFI as the main image** (4.77 m, for areas without Legion): `config_nicfi.yaml` overrides only resolution,
-chip size, boundary width and folders.
-
-```powershell
-python -m farmmap nicfi --month 2025-06 --config config_nicfi.yaml
-python -m farmmap ingest --config config_nicfi.yaml
-python -m farmmap tiles  --config config_nicfi.yaml
-```
-
-NICFI needs a free sign-up with Planet's NICFI programme and is **non-commercial use only**.
-
-## 6. Which data makes the best model
-
-After section 4 has fixed the labels. Same test blocks and reference, so F1 compares across rows:
-
-| Exp. | Image | Context | Options for `tiles` |
-|---|---|---|---|
-| L0 | Legion 0.5 m | none | `--set paths.tiles=data/tiles_L0` |
-| L1 | Legion 0.5 m | DE Africa | `--set 'context.use=["dea"]' paths.tiles=data/tiles_L1` |
-| L2 | Legion 0.5 m | DE Africa + Earth Engine | `--set 'context.use=["dea","gee"]' paths.tiles=data/tiles_L2` |
-| N0 | NICFI 4.77 m | none | `--config config_nicfi.yaml` |
-| N2 | NICFI 4.77 m | DE Africa + Earth Engine | `--config config_nicfi.yaml --set 'context.use=["dea","gee"]' paths.tiles=data/tiles_nicfi_N2` |
-
-Score as in section 4, then try `polygonize.context_filter` on the best.
-
-- **L1/L2 vs L0:** does time help? Watch recall for `<0.5 ha` and `merged_predictions`.
-- **N0/N2 vs L0:** what is lost at 4.77 m. If N2 is close for farms > 0.5 ha, NICFI can cover areas without Legion.
-- Keep the simplest setup within ~0.02 F1 of the best.
-
-## 7. Settings that matter most (`config.yaml`)
+## 5. Settings that matter most (`config.yaml`)
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -170,13 +112,11 @@ Score as in section 4, then try `polygonize.context_filter` on the best.
 | `labels.keep` | QA OK, both sources | `SOURCE: [Digitized]` if the scheme layer can't be fixed |
 | `labels.context_m` | 30 | background is trusted only this close to mapped farms |
 | `tiles.boundary_width_m` | 1.5 | width of the boundary class |
-| `context.use` | `[]` | context layers stacked onto chips at `tiles` |
-| `context.year` | 2025 | year the context layers describe: match the Legion scenes |
 | `model.encoder` | resnet34 | try `resnet50` / `efficientnet-b4` after a first baseline |
 | `polygonize.marker_threshold` | 0.55 | higher = fewer, larger farms (less splitting) |
 | `polygonize.min_area_m2` | 300 | smallest farm kept |
 
-## 8. Code map
+## 6. Code map
 
 ```
 farmmap/
@@ -184,8 +124,6 @@ farmmap/
   aoi.py         fence corridor + training area → AOI, SDX search boxes
   imagery.py     SDX files → PAN/MS pairing, RPC ortho, pansharpen, 8-bit stretch, VRT mosaic
   register.py    edge-alignment registration check
-  context.py     10 m context layers: DE Africa, stacking onto chips, zonal filter
-  gee.py         Earth Engine: embeddings PCA, Dynamic World, NICFI
   tiles.py       chips + masks, block-based train/val/test split
   model.py       U-Net (segmentation_models_pytorch), normalisation, checkpoints
   train.py       training loop (AMP, cosine LR, resume), CE + Dice loss
@@ -200,7 +138,5 @@ farmmap/
 
 - **Verified (macOS, Python 3.11, CPU):** the KMZ parser on your real files; the AOI and SDX boxes on your
   fence layers; on a synthetic PAN+MS scene: ingest, registration check, tiles, training, prediction,
-  polygonize, evaluate, KMZ export, and context bands end to end. `context --sources dea` and `gee` were run on
-  real data over a 5 km box in the pilot area.
-- **Not run yet:** anything on real Legion data (not downloaded yet), training at full scale, the NICFI export
-  (no NICFI access on the Earth Engine account yet).
+  polygonize, evaluate and KMZ export end to end.
+- **Not run yet:** anything on Planet imagery.

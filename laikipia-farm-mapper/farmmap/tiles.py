@@ -18,7 +18,6 @@ from rasterio.features import rasterize
 from rasterio.windows import Window, from_bounds
 from shapely.geometry import box
 
-from . import context as CTX
 from .labels import load_labels
 
 BG, INTERIOR, BOUNDARY, IGNORE = 0, 1, 2, 255
@@ -74,8 +73,6 @@ def make_tiles(cfg, mosaic: Path | None = None, out_dir: Path | None = None, lab
     context = gdf.geometry.buffer(float(cfg.labels.context_m)).union_all()
     sindex = gdf.sindex
     size = int(cfg.tiles.size_px)
-    ctx_files = CTX.sources(cfg)  # context layers appended as extra bands (context.use), may be empty
-    ctx_names = CTX.band_names(ctx_files)
     rows = []
     with rasterio.open(mosaic) as src:
         gsd = src.transform.a
@@ -99,8 +96,6 @@ def make_tiles(cfg, mosaic: Path | None = None, out_dir: Path | None = None, lab
                 if nodata.mean() > float(cfg.tiles.max_nodata_fraction):
                     continue
                 wt = src.window_transform(win)
-                if ctx_files:
-                    img = np.concatenate([img, CTX.read(ctx_files, src.crs, wt, (size, size))])
                 near = gdf.iloc[sindex.query(tb.buffer(5), predicate="intersects")]
                 mask = make_mask(wt, (size, size), near, ctx, nodata, cfg)
                 labelled = float((mask != IGNORE).mean())
@@ -113,15 +108,14 @@ def make_tiles(cfg, mosaic: Path | None = None, out_dir: Path | None = None, lab
                 with rasterio.open(out_dir / "images" / f"{tid}.tif", "w", count=img.shape[0], dtype="uint8",
                                    nodata=0, **prof) as d:
                     d.write(img)
-                    d.descriptions = tuple(src.descriptions) + tuple(ctx_names)
+                    d.descriptions = tuple(src.descriptions)
                 with rasterio.open(out_dir / "masks" / f"{tid}.tif", "w", count=1, dtype="uint8", nodata=IGNORE,
                                    **prof) as d:
                     d.write(mask, 1)
                 rows.append({"id": tid, "split": split, "x": x, "y": y, "labelled": round(labelled, 3),
                              "interior": round(float((mask == INTERIOR).mean()), 3),
                              "boundary": round(float((mask == BOUNDARY).mean()), 3)})
-        image_bands = list(src.descriptions)
-        bands = image_bands + ctx_names
+        bands = list(src.descriptions)
         mosaic_bounds = src.bounds
     index = pd.DataFrame(rows)
     if index.empty:
@@ -130,6 +124,6 @@ def make_tiles(cfg, mosaic: Path | None = None, out_dir: Path | None = None, lab
     blocks = blocks_gdf(mosaic_bounds, cfg)
     blocks.to_file(out_dir / "blocks.gpkg", driver="GPKG")
     (out_dir / "meta.yaml").write_text(
-        f"gsd_m: {gsd}\nsize_px: {size}\nbands: {bands}\nimage_bands: {len(image_bands)}\nclasses: [background, interior, boundary]\nignore: 255\n")
+        f"gsd_m: {gsd}\nsize_px: {size}\nbands: {bands}\nclasses: [background, interior, boundary]\nignore: 255\n")
     print(f"{len(index)} chips -> {out_dir}  {index.split.value_counts().to_dict()}")
     return index

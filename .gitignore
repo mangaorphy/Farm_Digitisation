@@ -27,3 +27,13 @@ laikipia-farm-mapper/outputs/
 
 # original GIS layers: kept on disk, not in git (the code uses only the copies in data/aoi/fences/)
 Map_Layers/
+
+# farm_boundary_detection: Planet imagery is licensed (E&R plan): never commit it
+farm_boundary_detection/data/imagery/raw/*
+!farm_boundary_detection/data/imagery/raw/.gitkeep
+farm_boundary_detection/data/imagery/orders/
+farm_boundary_detection/processed_data/
+farm_boundary_detection/models/
+farm_boundary_detection/outputs/
+farm_boundary_detection/logs/
+*.pth

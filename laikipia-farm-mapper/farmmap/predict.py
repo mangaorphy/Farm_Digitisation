@@ -12,7 +12,6 @@ import torch
 from rasterio.windows import Window, from_bounds
 from tqdm import tqdm
 
-from . import context as CTX
 from . import model as M
 
 
@@ -62,23 +61,12 @@ def predict(cfg, model_path: Path, raster: Path | None = None, out_path: Path | 
     pc = cfg.predict
     tile, overlap, chunk = int(pc.tile_px), int(pc.overlap_px), int(pc.chunk_px)
     halo = overlap
-    # context layers: the same sources the model was trained with (recorded in the checkpoint), from paths.context
-    want_ctx = list(meta.get("context_bands", []))
-    ctx_files = [Path(cfg.paths.context) / f"{s}.tif" for s in dict.fromkeys(b.split(":")[1] for b in want_ctx)]
-    missing = [str(f) for f in ctx_files if not f.exists()]
-    if missing:
-        raise FileNotFoundError(f"model needs context layers {missing}: run `python -m farmmap context` "
-                                "or point paths.context at them")
-    if CTX.band_names(ctx_files) != want_ctx:
-        raise ValueError(f"model was trained with context bands {want_ctx}, but {ctx_files} hold "
-                         f"{CTX.band_names(ctx_files)}: rebuild them with the training settings")
     with rasterio.open(raster) as src:
         n_image = src.count
         if abs(src.transform.a - meta["gsd_m"]) > 0.05 * meta["gsd_m"]:
             print(f"WARNING: raster pixel {src.transform.a} m but model trained at {meta['gsd_m']} m")
-        if n_image + len(want_ctx) != meta["in_channels"]:
-            raise ValueError(f"raster has {n_image} bands (+{len(want_ctx)} context), model expects "
-                             f"{meta['in_channels']} {meta['bands']}")
+        if n_image != meta["in_channels"]:
+            raise ValueError(f"raster has {n_image} bands, model expects {meta['in_channels']} {meta['bands']}")
         full = Window(0, 0, src.width, src.height)
         if bounds is not None:
             full = from_bounds(*bounds, src.transform).round_offsets().round_lengths().intersection(full)
@@ -97,9 +85,6 @@ def predict(cfg, model_path: Path, raster: Path | None = None, out_path: Path | 
                 if not (img[:, halo:halo + h, halo:halo + w] > 0).any():
                     continue
                 nodata = (img[:, halo:halo + h, halo:halo + w] == 0).all(axis=0)
-                if ctx_files:
-                    img = np.concatenate([img, CTX.read(ctx_files, src.crs, src.window_transform(read),
-                                                        (img.shape[1], img.shape[2]))])
                 prob = _infer_chunk(net, img, tile, overlap, int(pc.batch_size), dev, n_image)[
                     :, halo:halo + h, halo:halo + w]
                 out = np.clip(np.round(prob * 254) + 1, 1, 255).astype(np.uint8)  # 0 stays nodata

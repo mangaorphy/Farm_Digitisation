@@ -4,9 +4,6 @@
   aoi          fence corridor + training-parcel area -> data/aoi/ (AOI, SDX search boxes, KMZ to view)
   ingest      SDX downloads in data/imagery/raw -> aligned 8-bit scenes + mosaic.vrt
   check        registration check: are parcel outlines on visible edges? suggests per-scheme shifts
-  context      fetch 10 m context layers: --sources dea (Digital Earth Africa, open) gee (Earth Engine)
-  sentinel2    export a cloud-free Sentinel-2 composite (DE Africa, no login) as a scene (use config_s2.yaml)
-  nicfi        export a Planet NICFI monthly basemap from Earth Engine as a scene (use config_nicfi.yaml)
   tiles        cut training chips + masks (zip data/tiles for Kaggle)
   train        train the U-Net (Kaggle GPU)
   predict      model -> probability raster (whole mosaic, or --split test / --bbox)
@@ -81,14 +78,6 @@ def main(argv=None) -> None:
     s = add("check")
     s.add_argument("--max-shift", type=float, default=40.0)
     s.add_argument("--per-group", type=int, default=300)
-    s = add("context")
-    s.add_argument("--sources", nargs="+", default=["dea"], choices=["dea", "gee"])
-    s = add("sentinel2")
-    s.add_argument("--period", required=True, help="YYYY (annual), YYYY-H1 (Jan-Jun) or YYYY-H2 (Jul-Dec)")
-    s.add_argument("--out", help="folder (default: paths.imagery_raw)")
-    s = add("nicfi")
-    s.add_argument("--month", required=True, help="YYYY-MM, e.g. 2025-06")
-    s.add_argument("--out", help="folder (default: paths.imagery_raw)")
     add("tiles")
     s = add("train")
     s.add_argument("--tiles")
@@ -134,15 +123,6 @@ def main(argv=None) -> None:
     elif args.cmd == "check":
         from .register import check
         check(cfg, args.max_shift, args.per_group)
-    elif args.cmd == "context":
-        from .context import build
-        build(cfg, args.sources)
-    elif args.cmd == "sentinel2":
-        from .context import export_s2
-        export_s2(cfg, args.period, Path(args.out) if args.out else None)
-    elif args.cmd == "nicfi":
-        from .gee import export_nicfi
-        export_nicfi(cfg, args.month, Path(args.out) if args.out else None)
     elif args.cmd == "tiles":
         from .tiles import make_tiles
         make_tiles(cfg)
