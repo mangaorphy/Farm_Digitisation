@@ -121,6 +121,7 @@ model:
   psp_pooling: true           # pyramid scene pooling at the bridge (as in ResUNet-a)
   condition_interior_on_boundary: true  # interior head also sees the boundary prediction (conditioned multitasking)
   distance_head: false        # third head: distance to the farm's own outline (ResUNet-a); seeds for touching farms
+  input_upsample: 1           # 2 = enlarge the image x2 inside the network (small farms; 4x compute)
   dropout: 0.1
 
 # ---------------------------------------------------------------- loss
@@ -159,6 +160,7 @@ train:
   max_train_patches: null     # for quick tests
   multi_gpu: true             # use every visible GPU (DataParallel), e.g. Kaggle "GPU T4 x2"
   max_hours: null             # stop (resumably) after this many hours of training
+  init_from: null             # start from the weights of an earlier best_model.pth (fine-tuning)
 
 # ---------------------------------------------------------------- evaluation
 evaluation:

@@ -101,6 +101,8 @@ class Trainer:
         last = self.out / "latest_checkpoint.pth"
         if resume and last.exists():
             self._resume(last)
+        elif tc.get("init_from"):
+            self._init_from(Path(tc.init_from))
         log.info("device %s | %d train / %d val patches | %d bands %s | encoder %s | AMP %s",
                  self.device, len(self.train_loader.dataset), len(self.val_loader.dataset), in_ch,
                  self.norm_stats.get("band_names"), cfg.model.encoder, self.use_amp)
@@ -136,6 +138,18 @@ class Trainer:
         self.stopped = bool(ck.get("stopped"))
         log.info("resumed from %s at epoch %d (best %s %.4f at epoch %d)", path, self.start_epoch, self.monitor,
                  self.best, self.best_epoch)
+
+    def _init_from(self, path: Path) -> None:
+        """Fine-tuning: copy every weight of an earlier checkpoint whose name and shape match (a new head or a
+        different band count stays freshly initialised). Optimiser, schedule and history start fresh."""
+        if not path.exists():
+            raise FileNotFoundError(f"train.init_from not found: {path}")
+        src = load_checkpoint(path, self.device)["state_dict"]
+        own = self.net.state_dict()
+        ok = {k: v for k, v in src.items() if k in own and own[k].shape == v.shape}
+        self.net.load_state_dict(ok, strict=False)
+        log.info("initialised %d / %d tensors from %s (%d skipped: missing or different shape)",
+                 len(ok), len(own), path, len(own) - len(ok))
 
     def _write_history(self) -> None:
         if not self.history:

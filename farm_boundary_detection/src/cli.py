@@ -19,6 +19,8 @@ Model
   predict          probability rasters for images (default: every image in paths.imagery_dir)
   polygonize       probability raster(s) -> farm polygons (GeoJSON, Shapefile, GPKG, KMZ)
   run              predict + polygonize
+  zone             map one digitising zone: every image over it, fused, merged with the digitised farms,
+                   KMZ per work tile (e.g. --zone data/zones/mutara_path.kmz)
   demo             the whole pipeline on a synthetic scene (installation check)
 """
 from __future__ import annotations
@@ -124,6 +126,11 @@ def main(argv=None) -> None:
         s.add_argument("--model")
         s.add_argument("--images", nargs="+", help="GeoTIFFs (default: all in paths.imagery_dir)")
         s.add_argument("--name", help="name of the merged output when several images are given")
+    s = add("zone")
+    s.add_argument("--zone", required=True, help="KML/KMZ with the zone polygon (and optional T01.. tiles)")
+    s.add_argument("--model", nargs="+", help="model(s); several = ensemble (default: models/best_model.pth)")
+    s.add_argument("--images", nargs="+", help="GeoTIFFs (default: all in paths.imagery_dir)")
+    s.add_argument("--name", default=None, help="output name (default: the zone file name)")
     s = add("polygonize")
     s.add_argument("--prob", nargs="+", required=True, help="probability rasters from predict")
     s.add_argument("--name")
@@ -178,6 +185,13 @@ def main(argv=None) -> None:
         _polygonize(cfg, _predict(cfg, args), args.name)
     elif args.cmd == "polygonize":
         _polygonize(cfg, [Path(x) for x in args.prob], args.name)
+    elif args.cmd == "zone":
+        from .gis.zone import run_zone
+        models = [Path(m) for m in (args.model or [Path(cfg.paths.models_dir) / "best_model.pth"])]
+        name = args.name or Path(args.zone).stem
+        res = run_zone(cfg, models if len(models) > 1 else models[0], Path(args.zone), _images(cfg, args.images),
+                       Path(cfg.paths.outputs_dir) / "zones" / name, name)
+        log.info("%s\n%s", res["paths"]["kmz"], res["counts"].to_string())
 
 
 if __name__ == "__main__":

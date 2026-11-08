@@ -208,3 +208,111 @@ def test_model_with_distance_head_returns_three_outputs():
     with torch.no_grad():
         out = net(torch.randn(1, 4, 64, 64))
     assert len(out) == 3 and all(o.shape == (1, 1, 64, 64) for o in out)
+
+
+def test_remove_overlaps():
+    """Duplicates are dropped, small overlaps are trimmed off the lower-scoring farm, nothing overlaps after."""
+    import geopandas as gpd
+    from shapely.geometry import box
+    from src.gis.polygon_reconstruction import remove_overlaps
+
+    g = gpd.GeoDataFrame({"score": [0.9, 0.8, 0.7], "area_m2": [0, 0, 0]},
+                         geometry=[box(0, 0, 100, 100), box(95, 0, 195, 100), box(1, 1, 99, 99)], crs="EPSG:32737")
+    out = remove_overlaps(g, overlap=0.3, min_area_m2=200)
+    assert len(out) == 2                                   # the 0.7 copy of farm 1 is dropped
+    assert abs(out.area.iloc[1] - 9500) < 1                # 5 m strip cut off the 0.8 farm
+    assert out.geometry.iloc[0].intersection(out.geometry.iloc[1]).area < 1e-6
+    assert (out.area_m2 == out.area.round(1)).all()
+
+
+def test_input_upsample_keeps_output_size():
+    from src.models.multi_task_unet import MultiTaskResUNet
+    import torch
+
+    m = MultiTaskResUNet(8, "resnet18", pretrained=False, decoder_channels=(32, 16, 16, 8), input_upsample=2).eval()
+    with torch.no_grad():
+        out = m(torch.zeros(1, 8, 64, 48))
+    assert [tuple(o.shape) for o in out] == [(1, 1, 64, 48)] * 2
+
+
+def test_fuse_probabilities_averages_where_data(tmp_path):
+    """Two rasters on the same grid: overlap = mean, single coverage = that raster, nowhere = nodata."""
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+    from src.gis.zone import fuse_probabilities
+
+    tr = from_origin(500000, 9990000, 3, 3)
+    a = np.zeros((2, 10, 10), np.uint8); a[:, :, :6] = 101
+    b = np.zeros((2, 10, 10), np.uint8); b[:, :, 4:8] = 201
+    paths = []
+    for name, arr in (("a", a), ("b", b)):
+        p = tmp_path / f"{name}.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=10, height=10, count=2, dtype="uint8", crs="EPSG:32737",
+                           transform=tr, nodata=0) as d:
+            d.write(arr)
+        paths.append(p)
+    out = fuse_probabilities(paths, tmp_path / "f.tif", "EPSG:32737", (500000, 9989970, 500030, 9990000), 3)
+    f = rasterio.open(out).read()
+    assert (f[:, :, :4] == 101).all() and (f[:, :, 4:6] == 151).all() and (f[:, :, 6:8] == 201).all()
+    assert (f[:, :, 8:] == 0).all()
+
+
+def test_zone_product_keeps_digitised_and_adds_only_new():
+    import geopandas as gpd
+    from shapely.geometry import box as _box
+
+    def box(x0, y0, x1, y1):  # metres near Laikipia (UTM 37S)
+        return _box(x0 + 260000, y0 + 9990000, x1 + 260000, y1 + 9990000)
+    from src.gis.zone import zone_product
+
+    crs = "EPSG:32737"
+    zone = gpd.GeoDataFrame({"name": ["zone"]}, geometry=[box(0, 0, 1000, 1000)], crs=crs).to_crs(4326)
+    tiles = gpd.GeoDataFrame({"tile": ["T01", "T02"], "name": ["a", "b"]},
+                             geometry=[box(0, 0, 500, 1000), box(500, 0, 1000, 1000)], crs=crs).to_crs(4326)
+    dig = gpd.GeoDataFrame({"FARM_ID": ["LKP-1"]}, geometry=[box(100, 100, 200, 200)], crs=crs)
+    model = gpd.GeoDataFrame({"score": [0.9, 0.9, 0.5]}, geometry=[
+        box(105, 105, 195, 195),          # the digitised farm again -> dropped
+        box(190, 100, 290, 200),          # small overlap -> trimmed to x >= 200
+        box(600, 600, 700, 700)], crs=crs)  # new
+    out = zone_product(model, dig, zone, tiles)
+    out = out.to_crs(crs)
+    assert sorted(out.source) == ["Digitized", "Model", "Model"]
+    assert out.loc[out.source == "Digitized", "farm_id"].iloc[0] == "LKP-1"
+    trimmed = out[(out.source == "Model") & (out.tile == "T01")].geometry.iloc[0]
+    assert abs(trimmed.bounds[0] - 260200) < 1e-3
+    assert set(out[out.source == "Model"].review) == {"likely farm", "check"}
+    assert out[out.source == "Model"].tile.tolist().count("T02") == 1
+
+
+def test_read_zone_real_file():
+    from pathlib import Path
+    from src.gis.zone import read_zone
+
+    p = Path(__file__).resolve().parents[1] / "data" / "zones" / "mutara_path.kmz"
+    if not p.exists():
+        return
+    zone, tiles = read_zone(p)
+    assert len(zone) == 1 and len(tiles) == 11 and tiles.tile.iloc[0] == "T01"
+    assert 90e6 < zone.to_crs(zone.estimate_utm_crs()).area.iloc[0] < 97e6
+
+
+def test_zone_product_drops_blobs_not_digitised():
+    import geopandas as gpd
+    from shapely.geometry import box as _box
+    from src.gis.zone import zone_product
+
+    def box(x0, y0, x1, y1):
+        return _box(x0 + 260000, y0 + 9990000, x1 + 260000, y1 + 9990000)
+
+    crs = "EPSG:32737"
+    zone = gpd.GeoDataFrame({"name": ["zone"]}, geometry=[box(0, 0, 3000, 3000)], crs=crs)
+    tiles = gpd.GeoDataFrame({"tile": [], "name": []}, geometry=[], crs=crs)
+    dig = gpd.GeoDataFrame({"FARM_ID": ["BIG"]}, geometry=[box(2000, 2000, 2900, 2900)], crs=crs)   # 81 ha, kept
+    model = gpd.GeoDataFrame({"score": [0.9, 0.9, 0.9]}, geometry=[
+        box(0, 0, 1000, 1000),            # 100 ha blob -> dropped
+        box(1200, 0, 1210, 900),          # 10 x 900 m sliver, compactness ~0.03 -> dropped
+        box(1500, 1500, 1600, 1600)], crs=crs)   # 1 ha farm -> kept
+    out = zone_product(model, dig, zone, tiles, max_area_ha=10, min_compact=0.1).to_crs(crs)
+    assert sorted(out.farm_id.str[:3]) == ["AUT", "BIG"]
+    assert abs(out[out.source == "Model"].area.iloc[0] - 1e4) < 1

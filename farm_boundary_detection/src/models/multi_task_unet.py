@@ -117,7 +117,8 @@ class MultiTaskResUNet(nn.Module):
     def __init__(self, in_channels: int, encoder: str = "resnet34", pretrained: bool = True,
                  decoder_channels=(256, 128, 64, 32), full_resolution_branch: bool = True, psp_pooling: bool = True,
                  condition_interior_on_boundary: bool = True, dropout: float = 0.0,
-                 rgb_indices: list[int] | None = None, distance_head: bool = False):
+                 rgb_indices: list[int] | None = None, distance_head: bool = False,
+                 input_upsample: int = 1):
         super().__init__()
         if encoder not in ENCODERS:
             raise ValueError(f"encoder must be one of {sorted(ENCODERS)}, got {encoder!r}")
@@ -126,6 +127,8 @@ class MultiTaskResUNet(nn.Module):
         self.in_channels = in_channels
         self.condition = condition_interior_on_boundary
         self.has_distance = bool(distance_head)
+        self.input_upsample = int(input_upsample or 1)  # >1: the image is enlarged (bilinear) before the network
+        # and the outputs are averaged back: small farms span more encoder pixels; targets and outputs stay at 3 m
         weights = "DEFAULT" if pretrained else None
         try:
             net = getattr(torchvision.models, encoder)(weights=weights)
@@ -156,6 +159,13 @@ class MultiTaskResUNet(nn.Module):
         self.interior_head = Head(d4 + n_cond, d4)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        s = self.input_upsample
+        if s > 1:
+            x = F.interpolate(x, scale_factor=s, mode="bilinear", align_corners=False)
+            return tuple(F.avg_pool2d(o, s) for o in self._forward(x))
+        return self._forward(x)
+
+    def _forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         h, w = x.shape[-2:]
         ph, pw = (-h) % 32, (-w) % 32
         if ph or pw:  # reflect-pad to a multiple of 32, crop the outputs back
@@ -196,7 +206,8 @@ def build_model(cfg, in_channels: int, rgb_indices: list[int] | None = None,
         in_channels=in_channels, encoder=mc.encoder, pretrained=mc.pretrained if pretrained is None else pretrained,
         decoder_channels=tuple(mc.decoder_channels), full_resolution_branch=mc.full_resolution_branch,
         psp_pooling=mc.psp_pooling, condition_interior_on_boundary=mc.condition_interior_on_boundary,
-        dropout=float(mc.get("dropout", 0.0)), rgb_indices=rgb_indices, distance_head=bool(mc.get("distance_head", False)))
+        dropout=float(mc.get("dropout", 0.0)), rgb_indices=rgb_indices, distance_head=bool(mc.get("distance_head", False)),
+        input_upsample=int(mc.get("input_upsample", 1) or 1))
 
 
 def model_kwargs(cfg, in_channels: int, rgb: list[int] | None) -> dict:
@@ -206,7 +217,8 @@ def model_kwargs(cfg, in_channels: int, rgb: list[int] | None) -> dict:
             "decoder_channels": list(mc.decoder_channels), "full_resolution_branch": bool(mc.full_resolution_branch),
             "psp_pooling": bool(mc.psp_pooling), "condition_interior_on_boundary": bool(mc.condition_interior_on_boundary),
             "dropout": float(mc.get("dropout", 0.0)), "rgb_indices": rgb,
-            "distance_head": bool(mc.get("distance_head", False))}
+            "distance_head": bool(mc.get("distance_head", False)),
+            "input_upsample": int(mc.get("input_upsample", 1) or 1)}
 
 
 def load_checkpoint(path, device="cpu") -> dict:

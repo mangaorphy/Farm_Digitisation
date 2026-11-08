@@ -96,6 +96,29 @@ output, plus a private dataset if the `KAGGLE_API_TOKEN` secret is set. It then:
 
 **Run it with Save & Run All (Commit)**: an interactive session's `/kaggle/working` is lost when it stops.
 
+## Zone notebook: one digitising zone, fast (Mutara – Aberdares path)
+
+[`notebooks/kaggle_mutara_zone.ipynb`](notebooks/kaggle_mutara_zone.ipynb) works only on one zone
+([`data/zones/mutara_path.kmz`](data/zones/mutara_path.kmz): the zone polygon and work tiles T01–T11), in about
+1–2 hours. Attach the private dataset `mutara-zone-planetscope`, which holds the zone imagery (7 Jul and 30 Sep 2026)
+and the round-2 model. The notebook:
+
+1. keeps only the farms in the zone and splits them on 1.5 km blocks;
+2. fine-tunes the round-2 model (`train.init_from`), once at 3 m and once with the image enlarged ×2 inside the
+   network (`model.input_upsample: 2`, for small plots);
+3. compares both against the round-2 model as it is, on held-out zone farms, and keeps a fine-tuned model only if
+   it is clearly better;
+4. maps the zone (`src/gis/zone.py`): every date is predicted, the probabilities are averaged, polygons are built
+   once, and the farms already digitised are kept, with model farms added only where they are new. The output is
+   `zone/kmz/mutara_farms.kmz`, with one folder per tile: magenta = digitised, green = model (likely),
+   orange = model (check).
+
+From the command line: `python -m src zone --zone data/zones/mutara_path.kmz --model models/best_model.pth`.
+
+Merged maps have no overlapping polygons: a farm found in two scenes is kept once, and smaller overlaps,
+including slivers from simplifying each outline separately, are cut off the lower-scoring polygon
+(`remove_overlaps`).
+
 ## Pre-training checks (`python -m src check`, also run by `prepare`)
 
 dimensions / transform / CRS of image vs masks (scenes and patches) · farm points land on farm pixels after
@@ -129,4 +152,6 @@ the outline), `area_m2`, `area_ha`, `perimeter_m` (computed in a projected CRS),
 | `patches.size` / `stride` / `eval_stride` | 512 / 256 / 512 | |
 | `loss.lambda_boundary` | 2.0 | |
 | `model.encoder` | resnet34 | resnet18/50/101 |
+| `model.input_upsample` | 1 | 2 = image enlarged ×2 inside the network (small farms, 4× compute) |
+| `train.init_from` | null | start from an earlier `best_model.pth` (fine-tuning) |
 | `postprocess.seed_threshold` | 0.5 | higher = fewer, larger farms; tuned on validation in the notebook |

@@ -176,29 +176,57 @@ def polygonize(cfg, prob_path: Path, source_name: str | None = None) -> gpd.GeoD
     return gdf[cols + ["geometry"]]
 
 
-def merge_scenes(frames: list[gpd.GeoDataFrame], overlap: float = 0.3) -> gpd.GeoDataFrame:
-    """Farms from several (possibly overlapping) scenes -> one layer in a metric CRS. Where scenes overlap, a farm
-    found in both is kept once: higher score first, a later polygon overlapping a kept one by more than
-    ``overlap`` of the smaller area is dropped. Farm ids are renumbered."""
+def remove_overlaps(g: gpd.GeoDataFrame, overlap: float = 0.3, min_area_m2: float = 200.0) -> gpd.GeoDataFrame:
+    """Make a layer (metric CRS) non-overlapping, higher ``score`` first: a polygon overlapping an already kept one
+    by more than ``overlap`` of the smaller area is the same farm and is dropped; a smaller overlap is cut off the
+    lower-scoring polygon (largest remaining part kept, dropped if below ``min_area_m2``). Areas are recomputed."""
+    from shapely.geometry import Polygon
+
+    g = g.sort_values("score", ascending=False).reset_index(drop=True)
+    geoms = list(g.geometry)
+    keep, sindex = np.ones(len(g), bool), g.sindex
+    for j in range(len(g)):
+        geom = geoms[j]
+        for i in sindex.query(g.geometry.iloc[j], predicate="intersects"):
+            if i >= j or not keep[i] or geom.is_empty:
+                continue
+            inter = geom.intersection(geoms[i]).area
+            if inter <= 0:
+                continue
+            if inter > overlap * min(geom.area, geoms[i].area):
+                keep[j] = False
+                break
+            geom = geom.difference(geoms[i]).buffer(0)
+        if keep[j]:
+            parts = [p for p in getattr(geom, "geoms", [geom]) if isinstance(p, Polygon)]
+            geom = max(parts, key=lambda p: p.area) if parts else Polygon()
+            keep[j] = geom.area >= min_area_m2
+            geoms[j] = geom
+    g = g.set_geometry(gpd.GeoSeries(geoms, crs=g.crs))[keep].reset_index(drop=True)
+    if "area_m2" in g:
+        g["area_m2"] = g.area.round(1)
+    if "area_ha" in g:
+        g["area_ha"] = (g.area / 1e4).round(4)
+    if "perimeter_m" in g:
+        g["perimeter_m"] = g.length.round(1)
+    return g
+
+
+def merge_scenes(frames: list[gpd.GeoDataFrame], overlap: float = 0.3, min_area_m2: float = 200.0) -> gpd.GeoDataFrame:
+    """Farms from several (possibly overlapping) scenes -> one non-overlapping layer in a metric CRS. A farm found in
+    two scenes is kept once (higher score); smaller overlaps are cut off the lower-scoring polygon
+    (see ``remove_overlaps``). Farm ids are renumbered."""
     import pandas as pd
 
     frames = [f for f in frames if len(f)]
     if not frames:
         return gpd.GeoDataFrame({"farm_id": []}, geometry=[], crs="EPSG:4326")
     g = gpd.GeoDataFrame(pd.concat([f.to_crs("EPSG:4326") for f in frames], ignore_index=True), crs="EPSG:4326")
-    g = g.to_crs(g.estimate_utm_crs()).sort_values("score", ascending=False).reset_index(drop=True)
-    keep, sindex = np.ones(len(g), bool), g.sindex
-    for i, geom in enumerate(g.geometry):
-        if not keep[i]:
-            continue
-        for j in sindex.query(geom, predicate="intersects"):
-            if j > i and keep[j]:
-                other = g.geometry.iloc[j]
-                if geom.intersection(other).area > overlap * min(geom.area, other.area):
-                    keep[j] = False
-    out = g[keep].reset_index(drop=True)
+    g = g.to_crs(g.estimate_utm_crs())
+    n_in = len(g)
+    out = remove_overlaps(g, overlap, min_area_m2)
     out["farm_id"] = [f"AUTO-{i + 1:06d}" for i in range(len(out))]
-    log.info("merged %d scenes: %d polygons -> %d after removing duplicates in overlaps", len(frames), len(g), len(out))
+    log.info("merged %d scenes: %d polygons -> %d after removing duplicates and overlaps", len(frames), n_in, len(out))
     return out
 
 
