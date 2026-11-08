@@ -1,8 +1,9 @@
 """Task 6: multi-task loss.
 
-    total = lambda_interior * interior_loss + lambda_boundary * boundary_loss
+    total = lambda_interior * interior_loss + lambda_boundary * boundary_loss [+ lambda_distance * distance_loss]
     interior_loss = a * BCE(weighted by the boundary-aware map) + b * Dice
     boundary_loss = a * BCE(pos_weight) + b * Dice + c * Tversky + d * Focal
+    distance_loss = BCE with soft targets + soft Dice (only with the distance head; targets in [0, 1])
 
 Every term is computed only over valid pixels (``valid_mask`` = 1): nodata, cloud, QA-ignored farms and
 unlabelled land never contribute. All terms work on logits (sigmoid inside), in float32 even under AMP.
@@ -57,8 +58,10 @@ class MultiTaskLoss(nn.Module):
         self.alpha, self.beta = float(lc.get("tversky_alpha", 0.3)), float(lc.get("tversky_beta", 0.7))
         self.gamma = float(lc.get("focal_gamma", 2.0))
         self.use_weight_map = bool((lc.get("boundary_aware") or {}).get("w0", 0))
+        self.ld = float(lc.get("lambda_distance", 1.0))
 
-    def forward(self, interior_logits: torch.Tensor, boundary_logits: torch.Tensor, batch: dict) -> tuple[torch.Tensor, dict]:
+    def forward(self, interior_logits: torch.Tensor, boundary_logits: torch.Tensor, batch: dict,
+                distance_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, dict]:
         il, bl = interior_logits.float(), boundary_logits.float()
         ti, tb, v = batch["interior_mask"], batch["boundary_mask"], batch["valid_mask"]
         wmap = batch.get("weight_map") if self.use_weight_map else None
@@ -84,5 +87,10 @@ class MultiTaskLoss(nn.Module):
             parts["boundary_focal"] = focal(bl, tb, v, self.gamma)
             boundary = boundary + self.wb["focal"] * parts["boundary_focal"]
         total = self.li * interior + self.lb * boundary
+        if distance_logits is not None and "distance_mask" in batch:
+            dl, td = distance_logits.float(), batch["distance_mask"]
+            distance = masked_bce(dl, td, v) + soft_dice(dl, td, v)
+            parts["distance_loss"] = distance
+            total = total + self.ld * distance
         parts.update({"interior_loss": interior, "boundary_loss": boundary, "loss": total})
         return total, {k: float(x.detach()) for k, x in parts.items()}

@@ -120,12 +120,14 @@ model:
   full_resolution_branch: true  # extra full-resolution features: ResNet's stride-2 stem would blur 1-px boundaries
   psp_pooling: true           # pyramid scene pooling at the bridge (as in ResUNet-a)
   condition_interior_on_boundary: true  # interior head also sees the boundary prediction (conditioned multitasking)
+  distance_head: false        # third head: distance to the farm's own outline (ResUNet-a); seeds for touching farms
   dropout: 0.1
 
 # ---------------------------------------------------------------- loss
 loss:
   lambda_interior: 1.0
   lambda_boundary: 2.0        # boundary pixels are rare: weighted higher
+  lambda_distance: 1.0        # only used with model.distance_head
   interior: {bce: 1.0, dice: 1.0}
   boundary: {bce: 1.0, dice: 1.0, tversky: 0.5, focal: 0.0}
   boundary_pos_weight: 4.0    # BCE weight of boundary-positive pixels
@@ -155,6 +157,8 @@ train:
   run_checks: true            # run the pre-training validation checks first
   deterministic: false        # true = reproducible to the bit, but slower on GPU
   max_train_patches: null     # for quick tests
+  multi_gpu: true             # use every visible GPU (DataParallel), e.g. Kaggle "GPU T4 x2"
+  max_hours: null             # stop (resumably) after this many hours of training
 
 # ---------------------------------------------------------------- evaluation
 evaluation:
@@ -173,11 +177,12 @@ inference:
 # ---------------------------------------------------------------- polygon reconstruction
 postprocess:
   interior_threshold: 0.5     # extent: P(interior) above this
-  seed_threshold: 0.5         # seeds: P(interior) * (1 - P(boundary)) above this
+  seed_source: boundary       # boundary: P(int)*(1-P(bnd)) | distance | combined (need model.distance_head)
+  seed_threshold: 0.5         # seeds: seed score above this
   boundary_threshold: 0.5     # seeds never include pixels with P(boundary) above this
   min_seed_px: 15             # smaller seeds would split one farm into several
-  min_area_m2: 900            # 0.09 ha = 100 pixels
-  hole_area_m2: 900
+  min_area_m2: 200            # 0.02 ha = 22 pixels (many plots are only 5-20 px wide)
+  hole_area_m2: 200
   simplify_m: 1.5             # half a pixel
   block_px: 4096
   halo_px: 512                # farms larger than ~halo x 3 m may be cut by a block edge, then merged

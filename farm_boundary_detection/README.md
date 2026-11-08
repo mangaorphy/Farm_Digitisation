@@ -73,12 +73,28 @@ Any setting can be changed for one run: `python -m src train --set train.batch_s
 | **Full-resolution branch** in the decoder | The ResNet stem downsamples ×4 before the first skip connection, which blurs 1–2 px boundaries. |
 | ResUNet-a ideas: residual decoder blocks, PSP pooling, **conditioned heads** (interior sees the boundary prediction) | It is not a ResUNet-a reproduction: there is no atrous encoder, no distance or colour heads and no Tanimoto loss. The encoder is a pretrained torchvision ResNet. Its first conv is adapted to 4/8 bands (RGB filters on the R, G, B bands, the mean filter elsewhere). |
 | Loss: BCE + Dice (interior), BCE(pos_weight) + Dice + Tversky (boundary), λ_boundary = 2 | Boundary pixels are rare, and a missed boundary merges two farms, so Tversky β > α penalises misses. Interior BCE pixels near true boundaries are up-weighted: w = 1 + w0·exp(−d²/2σ²). |
+| **Distance head** (`model.distance_head`) | Predicts each pixel's distance to its farm's own outline, peaking once per farm. Its maxima seed one region per farm (`postprocess.seed_source: distance / combined`), which targets round 1's main error, farms split into pieces. |
+| **TTA and ensembles** | `inference.tta` averages over flips. `Predictor([model_a, model_b])` and `ensemble_caches` average several models. The notebook keeps an ensemble only if it beats the best single model on validation. |
 | **Model selection on individual farms** | Pixel accuracy is dominated by easy interior pixels. Experiments are compared on object F1 (one-to-one matching, IoU ≥ 0.5) against the hand-traced farms, with post-processing tuned on validation. Test is used once. |
 | Polygons: seeds = P(int)·(1−P(bnd)), 4-connected, watershed on P(bnd) | Connected components alone merge neighbours where a boundary is faint. 4-connectivity keeps a diagonal 1-px boundary separating. Blocks with halos keep large scenes in bounded memory. |
 
 Libraries: `opencv-python`, `scikit-learn` and `fiona` are not used. scipy and scikit-image cover the
 morphology and watershed. The split is geographic, so scikit-learn's random splitters don't apply. KML/KMZ is
 parsed directly, which is one pass instead of GDAL re-reading Earth Pro's ~70 folders.
+
+## Kaggle notebook (round 2)
+
+[`notebooks/kaggle_end_to_end.ipynb`](notebooks/kaggle_end_to_end.ipynb) trains the experiments under a time
+budget (and resumes later if the budget runs out). It backs up the models after each experiment: a zip in the
+output, plus a private dataset if the `KAGGLE_API_TOKEN` secret is set. It then:
+
+1. compares every model and an ensemble on the validation hand-traced farms, using a two-stage threshold search;
+2. tests the winner once;
+3. maps every scene;
+4. writes `best/report.html` with the data checks, training curves, comparison, pixel confusion matrices, object
+   outcomes, scores by farm size, test visuals and a map preview.
+
+**Run it with Save & Run All (Commit)**: an interactive session's `/kaggle/working` is lost when it stops.
 
 ## Pre-training checks (`python -m src check`, also run by `prepare`)
 

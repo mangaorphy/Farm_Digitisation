@@ -7,6 +7,7 @@ Each item is a dict::
     boundary_mask  float32 (1, H, W)  0/1
     valid_mask     float32 (1, H, W)  1 = pixel counts in loss and metrics (0 = nodata / cloud / ignored)
     weight_map     float32 (1, H, W)  boundary-aware pixel weights for the interior loss
+    distance_mask  float32 (1, H, W)  (if ``distance=True``) distance to the farm's own outline, 1 at its centre
     patch_id       str
 
 Normalisation (identical at inference): clip each band to the training percentiles, z-score with the training
@@ -77,11 +78,34 @@ def boundary_weight_map(boundary: np.ndarray, w0: float, sigma_px: float) -> np.
     return (1.0 + w0 * np.exp(-(d ** 2) / (2.0 * sigma_px ** 2))).astype(np.float32)
 
 
+def instance_distance(instance: np.ndarray) -> np.ndarray:
+    """Per farm: Euclidean distance (px) from each pixel to the nearest pixel outside that farm, divided by the
+    farm's maximum, so every farm goes from ~0 at its outline to 1 at its centre (0 outside farms).
+    Touching farms are separated because a neighbour's pixels count as "outside"."""
+    inst = instance.astype(np.int64)
+    out = np.zeros(inst.shape, np.float32)
+    if not inst.any():
+        return out
+    # a pixel is on an outline if any 4-neighbour has a different id
+    pad = np.pad(inst, 1, mode="edge")
+    edge = ((pad[1:-1, 1:-1] != pad[:-2, 1:-1]) | (pad[1:-1, 1:-1] != pad[2:, 1:-1]) |
+            (pad[1:-1, 1:-1] != pad[1:-1, :-2]) | (pad[1:-1, 1:-1] != pad[1:-1, 2:]) | (inst == 0))
+    d = ndi.distance_transform_edt(~edge).astype(np.float32) + 1.0
+    d[inst == 0] = 0
+    ids = np.unique(inst[inst > 0])
+    mx = ndi.maximum(d, labels=inst, index=ids)
+    scale = np.zeros(int(ids.max()) + 1, np.float32)
+    scale[ids] = np.asarray(mx, np.float32)
+    out = np.where(inst > 0, d / np.maximum(scale[inst], 1e-6), 0).astype(np.float32)
+    return out
+
+
 class FarmPatchDataset(Dataset):
     """Patches of one split. ``augment`` = training augmentations (config ``augmentation``)."""
 
     def __init__(self, processed_dir: str | Path, patch_ids: list[str], normalizer: Normalizer,
-                 augment: dict | None = None, boundary_aware: dict | None = None, seed: int = 0):
+                 augment: dict | None = None, boundary_aware: dict | None = None, seed: int = 0,
+                 distance: bool = False):
         self.dir = Path(processed_dir)
         self.ids = list(patch_ids)
         if not self.ids:
@@ -90,6 +114,7 @@ class FarmPatchDataset(Dataset):
         self.aug = augment
         self.ba = boundary_aware or {}
         self.seed = seed
+        self.distance = distance
         missing = [p for p in self.ids[:20] if not (self.dir / "images" / f"{p}.tif").exists()]
         if missing:
             raise FileNotFoundError(f"patch files missing in {self.dir}/images, e.g. {missing[:3]}")
@@ -102,8 +127,11 @@ class FarmPatchDataset(Dataset):
             return s.read()
 
     def load_raw(self, pid: str) -> dict[str, np.ndarray]:
-        return {"image": self._read("images", pid), "interior": self._read("interior_masks", pid)[0],
-                "boundary": self._read("boundary_masks", pid)[0], "valid": self._read("valid_masks", pid)[0]}
+        raw = {"image": self._read("images", pid), "interior": self._read("interior_masks", pid)[0],
+               "boundary": self._read("boundary_masks", pid)[0], "valid": self._read("valid_masks", pid)[0]}
+        if self.distance:
+            raw["instance"] = self._read("instance_masks", pid)[0]
+        return raw
 
     # ---------------------------------------------------------------- augmentation
     @staticmethod
@@ -143,15 +171,16 @@ class FarmPatchDataset(Dataset):
         x, ok = self.norm(raw["image"])
         interior, boundary = raw["interior"].astype(np.uint8), raw["boundary"].astype(np.uint8)
         valid = (raw["valid"].astype(bool) & ok).astype(np.uint8)
+        instance = raw.get("instance", np.zeros(interior.shape, np.uint32)).astype(np.int32)
         if self.aug:
             rng = np.random.default_rng(stable_seed(self.seed, pid, torch.initial_seed(), np.random.randint(1 << 30)))
-            x, interior, boundary, valid, data = self._spatial(
-                [x, interior, boundary, valid, ok.astype(np.uint8)], rng, self.aug)
+            x, interior, boundary, valid, data, instance = self._spatial(
+                [x, interior, boundary, valid, ok.astype(np.uint8), instance], rng, self.aug)
             # image pixels outside the labelled region are still real context: augment every DATA pixel
             x = self._radiometric(x, data.astype(bool), rng, self.aug)
             valid = (valid.astype(bool) & data.astype(bool)).astype(np.uint8)
         weight = boundary_weight_map(boundary, float(self.ba.get("w0", 0)), float(self.ba.get("sigma_px", 2.0)))
-        return {
+        item = {
             "image": torch.from_numpy(x.astype(np.float32)),
             "interior_mask": torch.from_numpy((interior > 0).astype(np.float32))[None],
             "boundary_mask": torch.from_numpy((boundary > 0).astype(np.float32))[None],
@@ -159,6 +188,9 @@ class FarmPatchDataset(Dataset):
             "weight_map": torch.from_numpy(weight)[None],
             "patch_id": pid,
         }
+        if self.distance:
+            item["distance_mask"] = torch.from_numpy(instance_distance(instance))[None]
+        return item
 
 
 def load_patch_table(cfg) -> pd.DataFrame:
@@ -184,7 +216,7 @@ def make_dataset(cfg, split: str, augment: bool | None = None, table: pd.DataFra
     norm = Normalizer.from_file(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
     aug = dict(cfg.augmentation) if (augment if augment is not None else split == "train") else None
     return FarmPatchDataset(cfg.paths.processed_dir, ids, norm, aug, dict(cfg.loss.get("boundary_aware") or {}),
-                            int(cfg.project.seed))
+                            int(cfg.project.seed), distance=bool(cfg.model.get("distance_head", False)))
 
 
 def make_dataloader(cfg, split: str, shuffle: bool | None = None, augment: bool | None = None,

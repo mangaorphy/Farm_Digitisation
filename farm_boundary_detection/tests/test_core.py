@@ -175,3 +175,36 @@ def test_dataset_augmentation_keeps_alignment_and_binary(tmp_path):
         valid = it["valid_mask"][0].numpy() > 0
         agree = (bright == (mask > 0))[valid & (np.abs(it["image"][0].numpy()) > 0.01)].mean()
         assert agree > 0.97
+
+
+def test_instance_distance_peaks_inside_each_farm():
+    from src.data.dataset import instance_distance
+    inst = np.zeros((20, 40), np.int32)
+    inst[2:18, 2:20], inst[2:18, 20:38] = 1, 2  # two touching farms
+    d = instance_distance(inst)
+    assert d.max() == pytest.approx(1.0) and d[inst == 0].max() == 0
+    assert d[10, 19] < 0.3 and d[10, 20] < 0.3  # low on the shared edge
+    assert d[10, 10] > 0.8 and d[10, 29] > 0.8  # high at each centre
+
+
+def test_segment_with_distance_seeds_and_min_area():
+    pc = load_config(ROOT / "configs" / "config.yaml").postprocess
+    pc["seed_source"], pc["min_area_m2"] = "distance", 0
+    p_int = np.zeros((40, 40), np.float32)
+    p_int[5:35, 5:35] = 0.95
+    p_bnd = np.full((40, 40), 0.1, np.float32)  # boundary invisible...
+    from src.data.dataset import instance_distance
+    inst = np.zeros((40, 40), np.int32)
+    inst[5:35, 5:20], inst[5:35, 20:35] = 1, 2
+    p_dist = instance_distance(inst)            # ...but the distance map still separates the two farms
+    lab = segment(p_int, p_bnd, pc, 3.0, p_dist)
+    assert len(np.unique(lab[lab > 0])) == 2
+    pc["min_area_m2"] = 10000                   # 1 ha: both 0.4 ha farms removed
+    assert segment(p_int, p_bnd, pc, 3.0, p_dist).max() == 0
+
+
+def test_model_with_distance_head_returns_three_outputs():
+    net = MultiTaskResUNet(4, "resnet18", pretrained=False, decoder_channels=(64, 32, 16, 16), distance_head=True).eval()
+    with torch.no_grad():
+        out = net(torch.randn(1, 4, 64, 64))
+    assert len(out) == 3 and all(o.shape == (1, 1, 64, 64) for o in out)

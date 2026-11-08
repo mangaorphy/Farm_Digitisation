@@ -35,10 +35,21 @@ log = logging.getLogger(__name__)
 FOUR = ndi.generate_binary_structure(2, 1)
 
 
-def segment(p_int: np.ndarray, p_bnd: np.ndarray, pc, gsd: float) -> np.ndarray:
-    """Instance label image (0 = no farm) from interior / boundary probabilities in [0, 1]."""
+def segment(p_int: np.ndarray, p_bnd: np.ndarray, pc, gsd: float, p_dist: np.ndarray | None = None) -> np.ndarray:
+    """Instance label image (0 = no farm) from interior / boundary (/ distance) probabilities in [0, 1].
+
+    ``postprocess.seed_source``: ``boundary`` = P(int)*(1-P(bnd)); ``distance`` = predicted distance to the
+    farm outline (needs a distance head); ``combined`` = mean of the two. Regions smaller than
+    ``postprocess.min_area_m2`` are removed, so patch-level evaluation and full-scene mapping agree."""
     extent = p_int > float(pc.interior_threshold)
-    seed_score = p_int * (1.0 - p_bnd)
+    source = pc.get("seed_source", "boundary") if p_dist is not None else "boundary"
+    boundary_score = p_int * (1.0 - p_bnd)
+    if source == "distance":
+        seed_score = p_dist
+    elif source == "combined":
+        seed_score = 0.5 * (boundary_score + p_dist)
+    else:
+        seed_score = boundary_score
     seeds = (seed_score > float(pc.seed_threshold)) & (p_bnd < float(pc.boundary_threshold)) & extent
     markers, n = ndi.label(seeds, structure=FOUR)
     if n == 0:
@@ -47,8 +58,16 @@ def segment(p_int: np.ndarray, p_bnd: np.ndarray, pc, gsd: float) -> np.ndarray:
     small = sizes < int(pc.min_seed_px)
     small[0] = False
     markers[small[markers]] = 0
-    labels = watershed(p_bnd, markers, mask=extent, connectivity=1)
-    return labels.astype(np.int32)
+    # flood over boundary ridges; with a distance map, also downhill from farm centres
+    elevation = p_bnd if p_dist is None or source == "boundary" else 0.5 * (p_bnd + (1.0 - p_dist))
+    labels = watershed(elevation, markers, mask=extent, connectivity=1).astype(np.int32)
+    min_px = int(float(pc.get("min_area_m2", 0)) / (gsd * gsd))
+    if min_px > 1 and labels.max():
+        counts = np.bincount(labels.ravel())
+        tiny = counts < min_px
+        tiny[0] = False
+        labels[tiny[labels]] = 0
+    return labels
 
 
 def _fill_small_holes(geom, max_area: float):
@@ -91,7 +110,8 @@ def _dedupe(recs: list[dict], overlap: float = 0.3) -> list[dict]:
 
 
 def polygonize(cfg, prob_path: Path, source_name: str | None = None) -> gpd.GeoDataFrame:
-    """Probability GeoTIFF (band 1 interior, band 2 boundary, uint8 1..255, 0 = nodata) -> farm polygons
+    """Probability GeoTIFF (band 1 interior, band 2 boundary, optional band 3 distance; uint8 1..255,
+    0 = nodata) -> farm polygons
     in the raster CRS, with farm_id, score, boundary_score, area_m2, area_ha, perimeter_m, source_image."""
     pc = cfg.postprocess
     block, halo = int(pc.block_px), int(pc.halo_px)
@@ -106,13 +126,14 @@ def polygonize(cfg, prob_path: Path, source_name: str | None = None) -> gpd.GeoD
         for r, c in tqdm(jobs, desc="polygonize", unit="block", leave=False):
             h, w = min(block, src.height - r), min(block, src.width - c)
             win = Window(c - halo, r - halo, w + 2 * halo, h + 2 * halo).intersection(full)
-            arr = src.read([1, 2], window=win)
+            arr = src.read(list(range(1, min(src.count, 3) + 1)), window=win)
             if not arr.any():
                 continue
             ok = arr[0] > 0
             p_int = np.where(ok, (arr[0].astype(np.float32) - 1) / 254, 0)
             p_bnd = np.where(ok, (arr[1].astype(np.float32) - 1) / 254, 1)
-            lab = segment(p_int, p_bnd, pc, gsd)
+            p_dist = np.where(ok, (arr[2].astype(np.float32) - 1) / 254, 0) if arr.shape[0] > 2 else None
+            lab = segment(p_int, p_bnd, pc, gsd, p_dist)
             if lab.max() == 0:
                 continue
             wt = src.window_transform(win)

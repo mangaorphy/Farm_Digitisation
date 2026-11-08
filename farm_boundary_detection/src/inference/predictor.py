@@ -8,7 +8,11 @@ The input goes through exactly the training preprocessing: the same bands (``ban
 clipping and z-scoring with the training statistics, nodata (and UDM2 non-clear pixels, if a UDM2 file is
 found next to the image) set to 0 and written as nodata in the output.
 
+Several models can be given (an ensemble): their probabilities are averaged. ``inference.tta`` also averages
+over flips.
+
 Output: ``outputs/prediction_masks/<scene>_prob.tif``, uint8, band 1 = P(interior), band 2 = P(boundary),
+band 3 = predicted distance to the farm outline (only if every model has a distance head),
 value = 1 + round(254 * p) (0 = nodata), same CRS / transform / size as the input.
 """
 from __future__ import annotations
@@ -44,10 +48,17 @@ def _find_udm2(image: Path) -> Path | None:
 
 
 class Predictor:
-    def __init__(self, model_path: str | Path, cfg, device: str | None = None):
+    def __init__(self, model_path: str | Path | list, cfg, device: str | None = None):
         self.cfg = cfg
         self.device = get_device(device)
-        self.model, self.ck = load_model(model_path, self.device)
+        paths = model_path if isinstance(model_path, (list, tuple)) else [model_path]
+        loaded = [load_model(p, self.device) for p in paths]
+        self.models = [m for m, _ in loaded]
+        self.ck = loaded[0][1]
+        for _, ck in loaded[1:]:
+            if ck["bands"] != self.ck["bands"] or ck["normalization"]["mean"] != self.ck["normalization"]["mean"]:
+                raise ValueError("ensemble models must share bands and normalisation (train them on the same patches)")
+        self.n_out = 3 if all(m.has_distance for m in self.models) else 2
         self.norm = Normalizer(self.ck["normalization"])
         self.bands = list(self.ck["bands"])
         ic = cfg.inference
@@ -60,20 +71,23 @@ class Predictor:
 
     @torch.no_grad()
     def _forward(self, x: np.ndarray) -> np.ndarray:
-        """(N, C, t, t) normalised -> (N, 2, t, t) probabilities (interior, boundary)."""
+        """(N, C, t, t) normalised -> (N, n_out, t, t) probabilities (interior, boundary[, distance]),
+        averaged over models and (with TTA) flips."""
         t = torch.from_numpy(x).to(self.device)
         flips = [(), (-1,), (-2,), (-1, -2)] if self.tta else [()]
-        acc = None
-        for f in flips:
-            xi = torch.flip(t, f) if f else t
-            il, bl = self.model(xi)
-            p = torch.cat([torch.sigmoid(il), torch.sigmoid(bl)], 1)
-            p = torch.flip(p, f) if f else p
-            acc = p if acc is None else acc + p
-        return (acc / len(flips)).float().cpu().numpy()
+        acc, n = None, 0
+        for model in self.models:
+            for f in flips:
+                xi = torch.flip(t, f) if f else t
+                out = model(xi)
+                p = torch.cat([torch.sigmoid(o) for o in out[: self.n_out]], 1)
+                p = torch.flip(p, f) if f else p
+                acc = p if acc is None else acc + p
+                n += 1
+        return (acc / n).float().cpu().numpy()
 
     def predict_array(self, x: np.ndarray, ok: np.ndarray) -> np.ndarray:
-        """Normalised (C, H, W) -> (2, H, W) blended probabilities. Edges smaller than a tile are padded."""
+        """Normalised (C, H, W) -> (n_out, H, W) blended probabilities. Edges smaller than a tile are padded."""
         C, H, W = x.shape
         if H < self.tile or W < self.tile:
             pad = np.zeros((C, max(H, self.tile), max(W, self.tile)), np.float32)
@@ -89,7 +103,7 @@ class Predictor:
         if xs[-1] + self.tile < W:
             xs.append(W - self.tile)
         coords = [(y, x0) for y in ys for x0 in xs if ok[y:y + self.tile, x0:x0 + self.tile].any()]
-        acc = np.zeros((2, H, W), np.float32)
+        acc = np.zeros((self.n_out, H, W), np.float32)
         wsum = np.zeros((H, W), np.float32)
         for i in range(0, len(coords), self.batch):
             part = coords[i:i + self.batch]
@@ -123,7 +137,7 @@ class Predictor:
                 full = rasterio.windows.from_bounds(*bounds, src.transform).round_offsets().round_lengths() \
                     .intersection(full)
             c0, r0, W, H = int(full.col_off), int(full.row_off), int(full.width), int(full.height)
-            profile = dict(driver="GTiff", width=W, height=H, count=2, dtype="uint8", crs=src.crs,
+            profile = dict(driver="GTiff", width=W, height=H, count=self.n_out, dtype="uint8", crs=src.crs,
                            transform=src.window_transform(full), nodata=0, tiled=True, blockxsize=512,
                            blockysize=512, compress="deflate", BIGTIFF="IF_SAFER")
             udm = rasterio.open(udm2) if udm2 else None
@@ -145,7 +159,7 @@ class Predictor:
                         out = np.clip(np.round(prob * 254) + 1, 1, 255).astype(np.uint8)
                         out[:, ~core_ok] = 0
                         dst.write(out, window=Window(c, r, w, h))
-                    dst.descriptions = ("interior_probability", "boundary_probability")
+                    dst.descriptions = ("interior_probability", "boundary_probability", "distance")[: self.n_out]
             finally:
                 if udm is not None:
                     udm.close()

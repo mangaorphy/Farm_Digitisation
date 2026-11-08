@@ -4,18 +4,20 @@ Inspired by ResUNet-a (Diakogiannis et al. 2020) - it borrows these ideas, it is
 
 * residual convolution blocks in the decoder;
 * pyramid scene pooling (PSP) at the bridge for multi-scale context;
-* conditioned multi-task heads: the boundary is predicted first and its probability is fed to the interior
-  head (ResUNet-a conditions extent on boundary and distance; there is no distance head here).
+* conditioned multi-task heads: the boundary (and, optionally, the distance) is predicted first and its
+  probability is fed to the interior head, as ResUNet-a conditions extent on boundary and distance;
+* optional distance head (``distance_head``): for every farm pixel, its distance to the farm's own outline,
+  normalised to 1 at the farm's centre. Its maxima are clean seeds for separating touching farms.
 
 Not taken from ResUNet-a: its atrous residual encoder (a pretrained torchvision ResNet is used instead, which
-matters with a few thousand labelled farms), the distance-transform and colour-reconstruction heads, and the
-Tanimoto loss.
+matters with a few thousand labelled farms), the colour-reconstruction head and the Tanimoto loss.
 
 One addition for 3 m imagery: the ResNet stem works at 1/2 and then 1/4 resolution, which blurs 1-2 px
 boundaries. A light convolutional branch on the full-resolution input is concatenated in the last decoder
 stage (``full_resolution_branch``).
 
-``forward`` returns ``(interior_logits, boundary_logits)``, each (B, 1, H, W). No sigmoid: apply it at inference.
+``forward`` returns ``(interior_logits, boundary_logits)``, each (B, 1, H, W), plus ``distance_logits`` as a third
+element when the distance head is on. No sigmoid: apply it at inference.
 Any H, W work (inputs are padded to a multiple of 32 internally and outputs cropped back).
 """
 from __future__ import annotations
@@ -115,7 +117,7 @@ class MultiTaskResUNet(nn.Module):
     def __init__(self, in_channels: int, encoder: str = "resnet34", pretrained: bool = True,
                  decoder_channels=(256, 128, 64, 32), full_resolution_branch: bool = True, psp_pooling: bool = True,
                  condition_interior_on_boundary: bool = True, dropout: float = 0.0,
-                 rgb_indices: list[int] | None = None):
+                 rgb_indices: list[int] | None = None, distance_head: bool = False):
         super().__init__()
         if encoder not in ENCODERS:
             raise ValueError(f"encoder must be one of {sorted(ENCODERS)}, got {encoder!r}")
@@ -123,6 +125,7 @@ class MultiTaskResUNet(nn.Module):
             raise ValueError("decoder_channels needs 4 values (1/16, 1/8, 1/4, 1/2 resolution)")
         self.in_channels = in_channels
         self.condition = condition_interior_on_boundary
+        self.has_distance = bool(distance_head)
         weights = "DEFAULT" if pretrained else None
         try:
             net = getattr(torchvision.models, encoder)(weights=weights)
@@ -148,9 +151,11 @@ class MultiTaskResUNet(nn.Module):
         self.full_res = nn.Sequential(ConvBNReLU(in_channels, 32), ConvBNReLU(32, 32)) if full_resolution_branch else None
         self.dec1 = ResidualBlock(d4 + (32 if full_resolution_branch else 0), d4)
         self.boundary_head = Head(d4, d4)
-        self.interior_head = Head(d4 + (1 if self.condition else 0), d4)
+        self.distance_head = Head(d4, d4) if self.has_distance else None
+        n_cond = (1 + int(self.has_distance)) if self.condition else 0
+        self.interior_head = Head(d4 + n_cond, d4)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         h, w = x.shape[-2:]
         ph, pw = (-h) % 32, (-w) % 32
         if ph or pw:  # reflect-pad to a multiple of 32, crop the outputs back
@@ -171,9 +176,17 @@ class MultiTaskResUNet(nn.Module):
             d = torch.cat([d, self.full_res(x)], 1)
         d = self.dec1(d)
         boundary_logits = self.boundary_head(d)
-        inp = torch.cat([d, torch.sigmoid(boundary_logits)], 1) if self.condition else d
+        distance_logits = self.distance_head(d) if self.distance_head is not None else None
+        if self.condition:
+            cond = [torch.sigmoid(boundary_logits)] + ([torch.sigmoid(distance_logits)] if distance_logits is not None else [])
+            inp = torch.cat([d, *cond], 1)
+        else:
+            inp = d
         interior_logits = self.interior_head(inp)
-        return interior_logits[..., :h, :w], boundary_logits[..., :h, :w]
+        out = (interior_logits[..., :h, :w], boundary_logits[..., :h, :w])
+        if distance_logits is not None:
+            out = out + (distance_logits[..., :h, :w],)
+        return out
 
 
 def build_model(cfg, in_channels: int, rgb_indices: list[int] | None = None,
@@ -183,7 +196,7 @@ def build_model(cfg, in_channels: int, rgb_indices: list[int] | None = None,
         in_channels=in_channels, encoder=mc.encoder, pretrained=mc.pretrained if pretrained is None else pretrained,
         decoder_channels=tuple(mc.decoder_channels), full_resolution_branch=mc.full_resolution_branch,
         psp_pooling=mc.psp_pooling, condition_interior_on_boundary=mc.condition_interior_on_boundary,
-        dropout=float(mc.get("dropout", 0.0)), rgb_indices=rgb_indices)
+        dropout=float(mc.get("dropout", 0.0)), rgb_indices=rgb_indices, distance_head=bool(mc.get("distance_head", False)))
 
 
 def model_kwargs(cfg, in_channels: int, rgb: list[int] | None) -> dict:
@@ -192,7 +205,8 @@ def model_kwargs(cfg, in_channels: int, rgb: list[int] | None) -> dict:
     return {"in_channels": in_channels, "encoder": mc.encoder, "pretrained": False,
             "decoder_channels": list(mc.decoder_channels), "full_resolution_branch": bool(mc.full_resolution_branch),
             "psp_pooling": bool(mc.psp_pooling), "condition_interior_on_boundary": bool(mc.condition_interior_on_boundary),
-            "dropout": float(mc.get("dropout", 0.0)), "rgb_indices": rgb}
+            "dropout": float(mc.get("dropout", 0.0)), "rgb_indices": rgb,
+            "distance_head": bool(mc.get("distance_head", False))}
 
 
 def load_checkpoint(path, device="cpu") -> dict:

@@ -46,8 +46,9 @@ def validate(model, loader, loss_fn, device, use_amp: bool, threshold: float, to
     for batch in loader:
         batch = _to(batch, device)
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            il, bl = model(batch["image"])
-        loss, _ = loss_fn(il, bl, batch)
+            out = model(batch["image"])
+        il, bl = out[0], out[1]
+        loss, _ = loss_fn(il, bl, batch, out[2] if len(out) > 2 else None)
         total += float(loss) * batch["image"].shape[0]
         n += batch["image"].shape[0]
         metrics.update(il, bl, batch)
@@ -70,9 +71,14 @@ class Trainer:
         self.val_loader = make_dataloader(cfg, "val", shuffle=False, augment=False, table=table)
         in_ch = len(self.norm_stats["bands"])
         self.rgb = rgb_indices(in_ch, self.norm_stats.get("band_names"), cfg.imagery.get("rgb_bands"))
-        self.model = build_model(cfg, in_ch, self.rgb).to(self.device)
+        self.net = build_model(cfg, in_ch, self.rgb).to(self.device)  # the bare network (saved / loaded)
+        self.model = self.net
+        if self.device.type == "cuda" and torch.cuda.device_count() > 1 and tc.get("multi_gpu", True):
+            self.model = torch.nn.DataParallel(self.net)  # e.g. Kaggle "GPU T4 x2"
+            log.info("using %d GPUs (DataParallel)", torch.cuda.device_count())
+        self.max_hours = float(tc.get("max_hours") or 0)
         self.loss_fn = MultiTaskLoss(cfg)
-        self.opt = torch.optim.AdamW(self.model.parameters(), lr=float(tc.lr), weight_decay=float(tc.weight_decay))
+        self.opt = torch.optim.AdamW(self.net.parameters(), lr=float(tc.lr), weight_decay=float(tc.weight_decay))
         self.epochs = int(tc.epochs)
         steps = self.epochs * max(len(self.train_loader), 1)
         warm = int(tc.get("warmup_epochs", 0)) * max(len(self.train_loader), 1)
@@ -106,11 +112,11 @@ class Trainer:
                 "bands": self.norm_stats["bands"], "gsd_m": self.norm_stats.get("gsd_m")}
 
     def _save_best(self, epoch: int, metrics: dict) -> None:
-        torch.save({"state_dict": self.model.state_dict(), "epoch": epoch, "metrics": metrics, **self._meta()},
+        torch.save({"state_dict": self.net.state_dict(), "epoch": epoch, "metrics": metrics, **self._meta()},
                    self.out / "best_model.pth")
 
     def _save_latest(self, epoch: int) -> None:
-        torch.save({"state_dict": self.model.state_dict(), "optimizer": self.opt.state_dict(),
+        torch.save({"state_dict": self.net.state_dict(), "optimizer": self.opt.state_dict(),
                     "scheduler": self.sched.state_dict(), "scaler": self.scaler.state_dict(), "epoch": epoch,
                     "best": self.best, "best_epoch": self.best_epoch, "history": self.history,
                     "stopped": self.stopped, **self._meta()}, self.out / "latest_checkpoint.pth")
@@ -120,7 +126,7 @@ class Trainer:
         if ck.get("model_kwargs", {}).get("in_channels") != len(self.norm_stats["bands"]):
             log.warning("latest_checkpoint.pth has a different number of bands: starting fresh")
             return
-        self.model.load_state_dict(ck["state_dict"])
+        self.net.load_state_dict(ck["state_dict"])
         self.opt.load_state_dict(ck["optimizer"])
         self.sched.load_state_dict(ck["scheduler"])
         if ck.get("scaler"):
@@ -149,15 +155,15 @@ class Trainer:
         for batch in self.train_loader:
             batch = _to(batch, self.device)
             with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-                il, bl = self.model(batch["image"])
-            loss, parts = self.loss_fn(il, bl, batch)
+                out = self.model(batch["image"])
+            loss, parts = self.loss_fn(out[0], out[1], batch, out[2] if len(out) > 2 else None)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss {parts}: check the input normalisation")
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             if clip:
                 self.scaler.unscale_(self.opt)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip)
             self.scaler.step(self.opt)
             self.scaler.update()
             if self.sched_kind == "cosine":
@@ -174,7 +180,12 @@ class Trainer:
         if self.stopped:
             log.info("training already finished (early stop); delete latest_checkpoint.pth or use --fresh to retrain")
             return self.out / "best_model.pth"
+        t_start = time.time()
         for epoch in range(self.start_epoch, self.epochs):
+            if self.max_hours and epoch > self.start_epoch and (time.time() - t_start) / 3600 > self.max_hours:
+                log.warning("time budget of %.1f h used: pausing at epoch %d (resume continues from "
+                            "latest_checkpoint.pth)", self.max_hours, epoch)
+                break
             t0 = time.time()
             tr = self.train_one_epoch()
             va = validate(self.model, self.val_loader, self.loss_fn, self.device, self.use_amp,
