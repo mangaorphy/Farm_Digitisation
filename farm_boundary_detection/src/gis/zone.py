@@ -123,14 +123,16 @@ def _largest(geom):
 def zone_product(model: gpd.GeoDataFrame, digitised: gpd.GeoDataFrame, zone: gpd.GeoDataFrame,
                  tiles: gpd.GeoDataFrame, duplicate_share: float = 0.3, min_area_m2: float = 200.0,
                  id_prefix: str = "AUTO", max_area_ha: float | None = None,
-                 min_compact: float = 0.0) -> gpd.GeoDataFrame:
+                 min_compact: float = 0.0, regularize_cfg: dict | None = None) -> gpd.GeoDataFrame:
     """Digitised farms (kept as they are) + model farms that are not already digitised; nothing overlaps.
 
     A model polygon is dropped when more than ``duplicate_share`` of it lies on digitised farms (it is one of
     them, drawn differently); otherwise the digitised area is cut off it. Model polygons are kept if their
     centroid is in the zone; digitised farms if they touch it. Model polygons larger than ``max_area_ha`` or less
     compact than ``min_compact`` (4*pi*area/perimeter^2) are dropped: in bush the model tends to produce large
-    irregular blobs that are not farms. Digitised farms are never filtered."""
+    irregular blobs that are not farms. ``regularize_cfg`` (``postprocess.regularize``): model polygons get straight
+    edges and a gap from each other and from the digitised farms (see ``regularize``). Digitised farms are never
+    filtered or changed."""
     utm = zone.estimate_utm_crs()
     z = zone.to_crs(utm).geometry.iloc[0]
     d = digitised.to_crs(utm)
@@ -143,7 +145,7 @@ def zone_product(model: gpd.GeoDataFrame, digitised: gpd.GeoDataFrame, zone: gpd
         m = m[share <= duplicate_share].copy()
         m["geometry"] = [_largest(g.difference(d_union).buffer(0)) for g in m.geometry]
     m = m[m.area >= min_area_m2].copy()
-    m["compact"] = (4 * np.pi * m.area / m.length.clip(lower=1e-9) ** 2).round(3)
+    m["compact"] = (4 * np.pi * m.area / m.length.clip(lower=1e-9) ** 2).round(3)   # of the traced shape
     n0 = len(m)
     if max_area_ha:
         m = m[m.area <= max_area_ha * 1e4]
@@ -152,6 +154,9 @@ def zone_product(model: gpd.GeoDataFrame, digitised: gpd.GeoDataFrame, zone: gpd
         log.info("dropped %d model polygons larger than %s ha or less compact than %s", n0 - len(m), max_area_ha,
                  min_compact)
     m["review"] = np.where((m["score"] >= 0.8) & (m["compact"] >= 0.3), "likely farm", "check")
+    if regularize_cfg and regularize_cfg.get("enabled", True) and len(m):
+        from .regularize import regularize
+        m = regularize(m, {**regularize_cfg, "min_area_m2": min_area_m2}, taken=d_union, reference=d)
     m["source"] = "Model"
     m["farm_id"] = [f"{id_prefix}-{i + 1:05d}" for i in range(len(m))]
     id_col = next((c for c in ("FARM_ID", "farm_uid", "farm_id") if c in d), None)
@@ -271,7 +276,8 @@ def run_zone(cfg, model_paths, zone_path: Path, images: list[Path], out_dir: Pat
         polys = load_farm_polygons(cfg)
         digitised = polys[0] if isinstance(polys, tuple) else polys
     product = zone_product(model, digitised, zone, tiles, min_area_m2=float(cfg.postprocess.min_area_m2),
-                           max_area_ha=max_area_ha, min_compact=min_compact)
+                           max_area_ha=max_area_ha, min_compact=min_compact,
+                           regularize_cfg=dict(cfg.postprocess.get("regularize") or {}))
     paths = export_polygons(product, out_dir, f"{name}_farms")
     paths["kmz"] = write_zone_kmz(product, tiles, out_dir / "kmz" / f"{name}_farms.kmz",
                                   f"{name}: digitised + model farms")

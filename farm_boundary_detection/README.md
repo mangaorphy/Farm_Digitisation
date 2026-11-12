@@ -123,6 +123,13 @@ A zone file without work tiles gets a 3 km grid of tiles (T01, T02, ...). Set `Z
    `zone/kmz/<zone>_farms.kmz`, with one folder per tile: magenta = digitised, green = model (likely),
    orange = model (check).
 
+**Straight, separated outlines** (`postprocess.regularize`, [`src/gis/regularize.py`](src/gis/regularize.py)): in the
+final map every model polygon takes the field-grid direction of the farms around it (digitised farms count most),
+becomes a rectangle when one of the same area fits it, otherwise gets edges snapped to that direction and square
+corners; overlaps go to the more confident polygon, and neighbours keep a 1 m gap (`gap_m`) so every farm has its
+own outline in Google Earth Pro. Digitised farms are never changed. To apply it to a result you already have:
+`python tools/straighten_result.py <zone>_farms.gpkg data/zones/<zone>.kmz <out_dir>`.
+
 From the command line: `python -m src zone --zone data/zones/salama_area.kmz --model models/best_model.pth`.
 
 Merged maps have no overlapping polygons: a farm found in two scenes is kept once, and smaller overlaps,

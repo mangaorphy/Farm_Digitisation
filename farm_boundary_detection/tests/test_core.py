@@ -394,3 +394,32 @@ def test_read_zone_without_tiles_gets_a_grid():
     assert len(zone) == 1 and tiles.tile.iloc[0] == "T01" and tiles.tile.is_unique and 10 <= len(tiles) <= 30
     assert abs(tiles.to_crs(utm).area.sum() - zone.to_crs(utm).area.iloc[0]) < 0.03 * zone.to_crs(utm).area.iloc[0]
     assert len(read_zone(p, tile_km=None)[1]) == 0
+
+
+def test_regularize_straight_separated_aligned():
+    """Two touching blobby farms -> rectangles in the local grid direction, >= gap apart, no overlap; the
+    digitised neighbour is untouched and kept at a distance."""
+    import math
+    import geopandas as gpd
+    from shapely import affinity
+    from shapely.geometry import box
+    from src.gis.regularize import regularize
+
+    def farm(x0, x1):   # a 30 m wide plot with rounded corners, rotated 30 deg about a common point
+        return affinity.rotate(box(x0 + 3, 3, x1 - 3, 57).buffer(3, quad_segs=4), 30, origin=(0, 0))
+    o = (260000, 9990000)
+    model = gpd.GeoDataFrame({"score": [0.9, 0.8]}, geometry=[affinity.translate(farm(0, 30), *o),
+                                                             affinity.translate(farm(30, 60), *o)], crs="EPSG:32737")
+    dig = gpd.GeoDataFrame({"FARM_ID": ["D1"]}, geometry=[affinity.translate(affinity.rotate(box(60, 0, 90, 60), 30, origin=(0, 0)), *o)],
+                           crs="EPSG:32737")
+    out = regularize(model, {"gap_m": 1.0, "min_area_m2": 50}, taken=dig.geometry.iloc[0], reference=dig)
+    assert len(out) == 2
+    a, b = out.geometry.iloc[0], out.geometry.iloc[1]
+    assert a.intersection(b).area == 0 and a.distance(b) >= 0.99
+    assert min(g.distance(dig.geometry.iloc[0]) for g in out.geometry) >= 0.99
+    for g in out.geometry:
+        assert len(g.exterior.coords) == 5                                   # rectangle
+        c = list(g.exterior.coords)
+        ang = math.degrees(math.atan2(c[1][1] - c[0][1], c[1][0] - c[0][0])) % 90
+        assert min(abs(ang - 30), abs(ang - 30 + 90), abs(ang - 30 - 90)) < 2  # follows the 30 deg field grid
+    assert all(abs(o2.area - o1.area) / o1.area < 0.15 for o1, o2 in zip(model.geometry, out.geometry))

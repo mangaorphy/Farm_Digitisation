@@ -201,5 +201,15 @@ postprocess:
   simplify_m: 1.5             # half a pixel (only used when coverage_simplify is false)
   coverage_simplify: true     # simplify all outlines together: a shared edge stays ONE line, so neighbouring
   coverage_tolerance_m: 3.0   # polygons can never cross or overlap (needs shapely >= 2.1)
+  regularize:                 # final map only (model polygons; digitised farms are never changed)
+    enabled: true
+    orientation_radius_m: 150 # each farm takes the dominant direction of the farms (digitised ones most) within this
+    rect_min_iou: 0.72        # becomes a rectangle if a same-area rectangle in that direction matches it this well
+    ortho_angle_deg: 20       # other shapes: edges within this angle of the direction (or 90 deg) are snapped
+    simplify_m: 3.0           # outline simplification before snapping
+    chamfer_m: 7.0            # clipped corners: diagonal edges shorter than this are removed (square corners)
+    spike_m: 3.0              # spikes, slivers and notches thinner than this are trimmed (3 m = one pixel)
+    min_iou: 0.70             # a snapped shape must still match the traced one, else the simplified one is kept
+    gap_m: 1.0                # gap between neighbouring farms (and from digitised farms): separate outlines
   block_px: 4096
   halo_px: 512                # farms larger than ~halo x 3 m may be cut by a block edge, then merged

@@ -360,7 +360,8 @@ export_polygons(allf, cfg_map.paths.outputs_dir, "model_farms_all")
 area = gpd.GeoDataFrame({"name": ["mapped area"]}, geometry=[unary_union(foot)], crs=4326)
 none = gpd.GeoDataFrame({"tile": [], "name": []}, geometry=[], crs=4326)
 farms = zone_product(allf, labels_all, area, none, min_area_m2=float(pp["min_area_m2"]),
-                     max_area_ha=MAX_FARM_HA, min_compact=MIN_COMPACT)
+                     max_area_ha=MAX_FARM_HA, min_compact=MIN_COMPACT,
+                     regularize_cfg=dict(pp.get("regularize") or {}))       # straight edges, 1 m gaps
 farms["tile"] = "Laikipia"
 paths = export_polygons(farms, cfg_map.paths.outputs_dir, "farms_digitised_plus_new")
 paths["kmz"] = write_zone_kmz(farms, none, cfg_map.paths.outputs_dir / "kmz" / "farms_digitised_plus_new.kmz",
