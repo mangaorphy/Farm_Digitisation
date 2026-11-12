@@ -103,24 +103,27 @@ the fine-tuned ones. Other published options looked at: *Delineate Anything* (YO
 resolution-agnostic; the Fields of the Planet paper reports it well below their model on PlanetScope) and
 Fields of The World's Sentinel-2 models (10 m: too coarse for plots under 0.5 ha).
 
-## Zone notebook: one digitising zone, fast (Mutara – Aberdares path)
+## Zone notebook: one digitising area, fast
 
-[`notebooks/kaggle_mutara_zone.ipynb`](notebooks/kaggle_mutara_zone.ipynb) works only on one zone
-([`data/zones/mutara_path.kmz`](data/zones/mutara_path.kmz): the zone polygon and work tiles T01–T11), in about
-1–2 hours. Attach the private dataset `mutara-zone-planetscope`, which holds the zone imagery (7 Jul and 30 Sep 2026)
-and the round-2 model. The notebook:
+[`notebooks/kaggle_zone.ipynb`](notebooks/kaggle_zone.ipynb) maps one area drawn in Google Earth Pro, in about
+1–3 hours. Zones live in [`data/zones/`](data/zones/): `salama_area.kmz` (137 km², private dataset
+`salama-area-planetscope`) and `mutara_path.kmz` (Mutara – Aberdares path, dataset `mutara-zone-planetscope`).
+A zone file without work tiles gets a 3 km grid of tiles (T01, T02, ...). Set `ZONE_FILE`, `ZONE_NAME` and
+`DATASET_NAME` at the top, attach the dataset (zone scenes + the round-2 model) and run. The notebook:
 
-1. keeps only the farms in the zone and splits them on 1.5 km blocks;
-2. fine-tunes the round-2 model (`train.init_from`), once at 3 m and once with the image enlarged ×2 inside the
-   network (`model.input_upsample: 2`, for small plots);
-3. compares both against the round-2 model as it is, on held-out zone farms, and keeps a fine-tuned model only if
-   it is clearly better;
+1. keeps only the farms in the zone and splits them into train / validation / test ground blocks (the block size
+   is chosen automatically so that validation and test both get farms);
+2. fine-tunes the round-2 network (`train.init_from`) at 3 m and with the image enlarged ×2
+   (`model.input_upsample: 2`), and the Fields of the Planet network; batch-norm statistics are re-estimated on
+   the zone's scenes first (`train.bn_recalibrate`), without which a pretrained network can predict nothing;
+3. compares them with the round-2 model as it is, on held-out zone farms, and keeps a fine-tuned model only if it
+   is clearly better (`SELECT_MARGIN`);
 4. maps the zone (`src/gis/zone.py`): every date is predicted, the probabilities are averaged, polygons are built
    once, and the farms already digitised are kept, with model farms added only where they are new. The output is
-   `zone/kmz/mutara_farms.kmz`, with one folder per tile: magenta = digitised, green = model (likely),
+   `zone/kmz/<zone>_farms.kmz`, with one folder per tile: magenta = digitised, green = model (likely),
    orange = model (check).
 
-From the command line: `python -m src zone --zone data/zones/mutara_path.kmz --model models/best_model.pth`.
+From the command line: `python -m src zone --zone data/zones/salama_area.kmz --model models/best_model.pth`.
 
 Merged maps have no overlapping polygons: a farm found in two scenes is kept once, and smaller overlaps,
 including slivers from simplifying each outline separately, are cut off the lower-scoring polygon

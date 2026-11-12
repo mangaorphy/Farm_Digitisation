@@ -69,6 +69,11 @@ class FTPUnet(nn.Module):
             log.info("loaded pretrained Fields of the Planet weights (%s)", hf_id)
         else:
             self.net = smp.Unet(encoder, encoder_weights=None, in_channels=8, classes=3)
+        # the EfficientNet encoder's batch norms track statistics at 1% per step: far too slow to adapt to new
+        # scenes during a short fine-tune. 10% (PyTorch's default) adapts within an epoch.
+        for mod in self.net.modules():
+            if isinstance(mod, nn.modules.batchnorm._BatchNorm):
+                mod.momentum = 0.1
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h, w = x.shape[-2:]

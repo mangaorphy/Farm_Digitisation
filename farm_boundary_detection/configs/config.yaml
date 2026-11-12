@@ -169,6 +169,8 @@ train:
   multi_gpu: true             # use every visible GPU (DataParallel), e.g. Kaggle "GPU T4 x2"
   max_hours: null             # stop (resumably) after this many hours of training
   init_from: null             # start from the weights of an earlier best_model.pth (fine-tuning)
+  bn_recalibrate: auto        # re-estimate batch-norm statistics on this data before training (AdaBN);
+                              # auto = when fine-tuning (init_from or a pretrained ftp_unet)
 
 # ---------------------------------------------------------------- evaluation
 evaluation:

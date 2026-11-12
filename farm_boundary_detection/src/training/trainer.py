@@ -101,8 +101,12 @@ class Trainer:
         last = self.out / "latest_checkpoint.pth"
         if resume and last.exists():
             self._resume(last)
-        elif tc.get("init_from"):
-            self._init_from(Path(tc.init_from))
+        else:
+            if tc.get("init_from"):
+                self._init_from(Path(tc.init_from))
+            recal = tc.get("bn_recalibrate", "auto")
+            if recal is True or (recal == "auto" and (tc.get("init_from") or cfg.model.get("arch") == "ftp_unet")):
+                self._recalibrate_bn()
         log.info("device %s | %d train / %d val patches | %d bands %s | encoder %s | AMP %s",
                  self.device, len(self.train_loader.dataset), len(self.val_loader.dataset), in_ch,
                  self.norm_stats.get("band_names"),
@@ -152,6 +156,33 @@ class Trainer:
         self.net.load_state_dict(ok, strict=False)
         log.info("initialised %d / %d tensors from %s (%d skipped: missing or different shape)",
                  len(ok), len(own), path, len(own) - len(ok))
+
+    @torch.no_grad()
+    def _recalibrate_bn(self, max_batches: int = 50) -> None:
+        """Re-estimate every batch-norm layer's running statistics on this data before fine-tuning (AdaBN).
+
+        A pretrained network's statistics describe its original training images. On other scenes they can be so
+        far off that the network, in evaluation mode, predicts nothing at all, and the slow running update during
+        a short fine-tune never catches up. Here they are recomputed exactly (cumulative average) from up to
+        ``max_batches`` training batches; the weights are not changed."""
+        bns = [m for m in self.net.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+        if not bns:
+            return
+        saved = [m.momentum for m in bns]
+        for m in bns:
+            m.reset_running_stats()
+            m.momentum = None
+        self.net.train()
+        n = 0
+        for batch in self.train_loader:
+            if n >= max_batches:
+                break
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                self.net(batch["image"].to(self.device, non_blocking=True))
+            n += 1
+        for m, s in zip(bns, saved):
+            m.momentum = s
+        log.info("re-estimated %d batch-norm layers on %d training batches (AdaBN)", len(bns), n)
 
     def _write_history(self) -> None:
         if not self.history:

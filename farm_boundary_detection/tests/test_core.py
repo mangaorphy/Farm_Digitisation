@@ -380,3 +380,17 @@ def test_simplify_together_neighbours_never_cross():
     assert abs(out.area.sum() - gdf.area.sum()) < 0.02 * gdf.area.sum()
     sep = gdf.geometry.simplify(3.0)
     assert sep.iloc[0].intersection(sep.iloc[1]).area > 1.0        # the old way: neighbours cross
+
+
+def test_read_zone_without_tiles_gets_a_grid():
+    from pathlib import Path
+    from src.gis.zone import read_zone
+
+    p = Path(__file__).resolve().parents[1] / "data" / "zones" / "salama_area.kmz"
+    if not p.exists():
+        return
+    zone, tiles = read_zone(p)
+    utm = zone.estimate_utm_crs()
+    assert len(zone) == 1 and tiles.tile.iloc[0] == "T01" and tiles.tile.is_unique and 10 <= len(tiles) <= 30
+    assert abs(tiles.to_crs(utm).area.sum() - zone.to_crs(utm).area.iloc[0]) < 0.03 * zone.to_crs(utm).area.iloc[0]
+    assert len(read_zone(p, tile_km=None)[1]) == 0

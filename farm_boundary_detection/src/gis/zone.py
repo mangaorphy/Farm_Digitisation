@@ -10,7 +10,8 @@
 5. the result is written per work tile: GPKG / GeoJSON (QGIS) and a KMZ with a folder per tile (Earth Pro).
 
 The zone file is a KML/KMZ (or any vector file) holding the zone polygon (its name contains "zone") and,
-optionally, work tiles named "T01 ...", "T02 ...".
+optionally, work tiles named "T01 ...", "T02 ...". A file with a single polygon and no tiles (e.g. an area
+drawn in Google Earth Pro) is the zone, and gets a 3 km grid of work tiles.
 """
 from __future__ import annotations
 
@@ -31,8 +32,33 @@ from shapely.ops import unary_union
 log = logging.getLogger(__name__)
 
 
-def read_zone(path: Path) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """-> (zone: one polygon, tiles: name + geometry; empty if none), both EPSG:4326."""
+def grid_tiles(zone: gpd.GeoDataFrame, tile_km: float = 3.0) -> gpd.GeoDataFrame:
+    """Work tiles for a zone drawn without any: a ``tile_km`` grid clipped to the zone, numbered T01, T02, ...
+    from the north-west corner, row by row. Slivers under 5% of a full tile join no tile ("outside tiles")."""
+    utm = zone.estimate_utm_crs()
+    z = zone.to_crs(utm).geometry.iloc[0]
+    step = tile_km * 1000.0
+    x0, y0, x1, y1 = z.bounds
+    rows = []
+    y = y1
+    while y > y0:
+        x = x0
+        while x < x1:
+            cell = box(x, y - step, x + step, y).intersection(z)
+            if cell.area >= 0.05 * step * step:
+                rows.append(cell)
+            x += step
+        y -= step
+    if not rows:
+        rows = [z]
+    names = [f"T{i + 1:02d}" for i in range(len(rows))]
+    return gpd.GeoDataFrame({"tile": names, "name": [f"{n} ({g.area / 1e6:.1f} km2)" for n, g in zip(names, rows)]},
+                            geometry=rows, crs=utm).to_crs("EPSG:4326")
+
+
+def read_zone(path: Path, tile_km: float | None = 3.0) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """-> (zone: one polygon, tiles: tile + name + geometry), both EPSG:4326. A file without work tiles gets a
+    ``tile_km`` grid (``None`` = no tiles)."""
     from ..data.ingestion import read_vector_file
 
     g, _ = read_vector_file(Path(path))
@@ -49,7 +75,10 @@ def read_zone(path: Path) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     tiles = g[is_tile].copy()
     tiles["tile"] = name[is_tile].str.extract(r"^\s*(T\d+)", expand=False).values
     zone = gpd.GeoDataFrame({"name": ["zone"]}, geometry=[zone_geom], crs="EPSG:4326")
-    return zone, tiles[["tile", "name", "geometry"]].reset_index(drop=True)
+    tiles = tiles[["tile", "name", "geometry"]].reset_index(drop=True)
+    if tiles.empty and tile_km:
+        tiles = grid_tiles(zone, tile_km)
+    return zone, tiles
 
 
 def fuse_probabilities(probs: list[Path], out_path: Path, crs, bounds: tuple, res: float = 3.0) -> Path:
