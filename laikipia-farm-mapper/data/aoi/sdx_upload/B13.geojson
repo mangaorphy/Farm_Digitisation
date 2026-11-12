@@ -1,1 +1,0 @@
-{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"box": "B13", "priority": 2, "covers": "fence corridor", "aoi_km2_inside": 256.0}, "geometry": {"type": "Polygon", "coordinates": [[[36.66405, 0.36159], [36.66399, 0.54238], [36.48441, 0.54231], [36.48447, 0.36154], [36.66405, 0.36159]]]}}]}

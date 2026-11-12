@@ -33,9 +33,10 @@ python -m src planet-download --order-id <id printed by planet-order>
 ```
 
 **Kaggle** (preprocess, train, compare, map): upload the downloaded order folder
-(`data/imagery/raw/<order id>/`) as a **private** Kaggle dataset named `laikipia-planetscope`, then open
-[`notebooks/kaggle_end_to_end.ipynb`](notebooks/kaggle_end_to_end.ipynb), turn on GPU and Internet, attach the
-dataset and **Save & Run All**. Results: `best/map/kmz/all_farms.kmz` and the files next to it.
+(`data/imagery/raw/<order id>/`) as a **private** Kaggle dataset (here: `laikipia-planetscope`), then open
+[`notebooks/kaggle_round3_pretrained.ipynb`](notebooks/kaggle_round3_pretrained.ipynb), turn on GPU and Internet,
+attach the dataset and **Save & Run All**. Results: `best/map/kmz/farms_digitised_plus_new.kmz` and the files
+next to it.
 
 **Everything also runs from the command line:**
 
@@ -82,19 +83,25 @@ Libraries: `opencv-python`, `scikit-learn` and `fiona` are not used. scipy and s
 morphology and watershed. The split is geographic, so scikit-learn's random splitters don't apply. KML/KMZ is
 parsed directly, which is one pass instead of GDAL re-reading Earth Pro's ~70 folders.
 
-## Kaggle notebook (round 2)
+## Round 3: a network pretrained on PlanetScope fields; polygons that cannot cross
 
-[`notebooks/kaggle_end_to_end.ipynb`](notebooks/kaggle_end_to_end.ipynb) trains the experiments under a time
-budget (and resumes later if the budget runs out). It backs up the models after each experiment: a zip in the
-output, plus a private dataset if the `KAGGLE_API_TOKEN` secret is set. It then:
+[`notebooks/kaggle_round3_pretrained.ipynb`](notebooks/kaggle_round3_pretrained.ipynb)
 
-1. compares every model and an ensemble on the validation hand-traced farms, using a two-stage threshold search;
-2. tests the winner once;
-3. maps every scene;
-4. writes `best/report.html` with the data checks, training curves, comparison, pixel confusion matrices, object
-   outcomes, scores by farm size, test visuals and a map preview.
+| Change | Why |
+|---|---|
+| `model.arch: ftp_unet` ([`src/models/ftp_unet.py`](src/models/ftp_unet.py)) | The **Fields of the Planet** U-Net (EfficientNet-B3; arXiv:2607.04449, July 2026) is trained on 3 m PlanetScope and the 1.6 million field polygons of Fields of The World (24 countries, Kenya included), for field interior + boundary: the same sensor, resolution and task as here. It replaces ImageNet weights as the starting point. Weights: Hugging Face `taylor-geospatial/ftp-b3`, CC-BY-NC-4.0 (research use). |
+| How it is plugged in | It takes 2 seasons × 4 bands (blue, green, red, NIR) as reflectance (`normalization.mode: scale`) and predicts 3 exclusive classes. The wrapper picks the 4 bands from the 8-band scenes, gives the same image as both seasons, and converts the classes exactly to this pipeline's two outputs (P(farm) = P(interior) + P(boundary); P(boundary)). Loss, metrics, prediction and polygon building are unchanged. |
+| `postprocess.seed_source: edt` | Each seed blob is split at its narrow necks, so two farms joined through a gap in a faint boundary are still separated. Included in the threshold search. |
+| `postprocess.coverage_simplify` | Outlines are simplified **together** (`shapely.coverage_simplify`): a boundary shared by two farms stays one line, so neighbouring polygons cannot cross. Before, each polygon was simplified alone and neighbours crossed. |
+| Final map `farms_digitised_plus_new` | Digitised farms kept as they are + model farms only where they are new; model polygons that are very large or ragged are dropped. |
 
-**Run it with Save & Run All (Commit)**: an interactive session's `/kaggle/working` is lost when it stops.
+The notebook trains under a time budget, compares every model on the hand-traced validation farms with a
+two-stage threshold search, tests the winner once, maps every scene and writes `best/report.html` (data checks,
+training curves, comparison, confusion matrices, scores by farm size, map preview). Run it with **Save & Run All
+(Commit)**: an interactive session's output is lost when it stops. It scores the round-2 model and the released model (not fine-tuned) on the same hand-traced farms as
+the fine-tuned ones. Other published options looked at: *Delineate Anything* (YOLO instance segmentation,
+resolution-agnostic; the Fields of the Planet paper reports it well below their model on PlanetScope) and
+Fields of The World's Sentinel-2 models (10 m: too coarse for plots under 0.5 ha).
 
 ## Zone notebook: one digitising zone, fast (Mutara – Aberdares path)
 
@@ -152,6 +159,7 @@ the outline), `area_m2`, `area_ha`, `perimeter_m` (computed in a projected CRS),
 | `patches.size` / `stride` / `eval_stride` | 512 / 256 / 512 | |
 | `loss.lambda_boundary` | 2.0 | |
 | `model.encoder` | resnet34 | resnet18/50/101 |
+| `model.arch` | resunet | `ftp_unet` = pretrained Fields of the Planet U-Net (with `normalization.mode: scale`) |
 | `model.input_upsample` | 1 | 2 = image enlarged ×2 inside the network (small farms, 4× compute) |
 | `train.init_from` | null | start from an earlier `best_model.pth` (fine-tuning) |
 | `postprocess.seed_threshold` | 0.5 | higher = fewer, larger farms; tuned on validation in the notebook |

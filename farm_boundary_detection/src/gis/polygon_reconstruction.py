@@ -39,10 +39,15 @@ def segment(p_int: np.ndarray, p_bnd: np.ndarray, pc, gsd: float, p_dist: np.nda
     """Instance label image (0 = no farm) from interior / boundary (/ distance) probabilities in [0, 1].
 
     ``postprocess.seed_source``: ``boundary`` = P(int)*(1-P(bnd)); ``distance`` = predicted distance to the
-    farm outline (needs a distance head); ``combined`` = mean of the two. Regions smaller than
+    farm outline (needs a distance head); ``combined`` = mean of the two; ``edt`` = the ``boundary`` seeds, each
+    blob then split at its narrow necks (one marker per peak of the blob's distance transform, peaks at least
+    ``edt_h`` pixels higher than the neck between them): two farms whose seeds join through a gap in a faint
+    boundary are still separated. Regions smaller than
     ``postprocess.min_area_m2`` are removed, so patch-level evaluation and full-scene mapping agree."""
     extent = p_int > float(pc.interior_threshold)
-    source = pc.get("seed_source", "boundary") if p_dist is not None else "boundary"
+    source = pc.get("seed_source", "boundary")
+    if p_dist is None and source in ("distance", "combined"):
+        source = "boundary"
     boundary_score = p_int * (1.0 - p_bnd)
     if source == "distance":
         seed_score = p_dist
@@ -54,12 +59,18 @@ def segment(p_int: np.ndarray, p_bnd: np.ndarray, pc, gsd: float, p_dist: np.nda
     markers, n = ndi.label(seeds, structure=FOUR)
     if n == 0:
         return np.zeros(p_int.shape, np.int32)
+    if source == "edt":
+        from skimage.morphology import h_maxima
+        depth = ndi.distance_transform_edt(seeds).astype(np.float32)
+        peaks, _ = ndi.label(h_maxima(depth, float(pc.get("edt_h", 2.0))), structure=np.ones((3, 3), bool))
+        # grow the peaks back over their own seed blob: one marker per farm core, all seed pixels kept
+        markers = watershed(-depth, peaks, mask=seeds, connectivity=1).astype(np.int32)
     sizes = np.bincount(markers.ravel())
     small = sizes < int(pc.min_seed_px)
     small[0] = False
     markers[small[markers]] = 0
     # flood over boundary ridges; with a distance map, also downhill from farm centres
-    elevation = p_bnd if p_dist is None or source == "boundary" else 0.5 * (p_bnd + (1.0 - p_dist))
+    elevation = p_bnd if p_dist is None or source in ("boundary", "edt") else 0.5 * (p_bnd + (1.0 - p_dist))
     labels = watershed(elevation, markers, mask=extent, connectivity=1).astype(np.int32)
     min_px = int(float(pc.get("min_area_m2", 0)) / (gsd * gsd))
     if min_px > 1 and labels.max():
@@ -159,8 +170,11 @@ def polygonize(cfg, prob_path: Path, source_name: str | None = None) -> gpd.GeoD
         log.warning("%s: no farms found", prob_path)
         return gpd.GeoDataFrame({c: [] for c in cols}, geometry=[], crs=crs)
     gdf = gpd.GeoDataFrame(kept, geometry="geometry", crs=crs)
-    gdf["geometry"] = gdf.geometry.buffer(0).simplify(float(pc.simplify_m), preserve_topology=True)
-    gdf["geometry"] = gdf.geometry.apply(lambda g: _fill_small_holes(g, float(pc.hole_area_m2)))
+    gdf["geometry"] = gdf.geometry.buffer(0)
+    gdf = simplify_together(gdf, pc, gsd)
+    # holes smaller than the smallest farm kept cannot contain another farm: filling them creates no overlap
+    hole = min(float(pc.hole_area_m2), float(pc.min_area_m2))
+    gdf["geometry"] = gdf.geometry.apply(lambda g: _fill_small_holes(g, hole))
     metric = gdf if CRS.from_user_input(crs).is_projected else gdf.to_crs(gdf.estimate_utm_crs())
     gdf["area_m2"] = metric.area.round(1).values
     gdf["perimeter_m"] = metric.length.round(1).values
@@ -174,6 +188,31 @@ def polygonize(cfg, prob_path: Path, source_name: str | None = None) -> gpd.GeoD
     gdf.insert(0, "farm_id", [f"AUTO-{i + 1:06d}" for i in range(len(gdf))])
     log.info("%s: %d farm polygons", stem, len(gdf))
     return gdf[cols + ["geometry"]]
+
+
+def simplify_together(gdf: gpd.GeoDataFrame, pc, gsd: float) -> gpd.GeoDataFrame:
+    """Smooth the pixel-staircase outlines WITHOUT letting neighbours cross.
+
+    Simplifying each polygon on its own moves the two copies of a shared edge differently, so neighbouring farms
+    end up crossing each other. Here the polygons are first made strictly non-overlapping (they come from one
+    pixel grid, so shared edges are identical), then simplified as one coverage: a shared edge is simplified
+    once and stays shared. Falls back to per-polygon simplification on old shapely (< 2.1)."""
+    import shapely
+
+    if not bool(pc.get("coverage_simplify", True)) or not hasattr(shapely, "coverage_simplify") or len(gdf) == 0:
+        gdf["geometry"] = gdf.geometry.simplify(float(pc.simplify_m), preserve_topology=True)
+        return gdf
+    projected = CRS.from_user_input(gdf.crs).is_projected
+    if projected:   # copies of one farm from neighbouring blocks: keep one, cut partial overlaps (exact, on pixels)
+        gdf = remove_overlaps(gdf, 0.3, 0.0)
+    tol = float(pc.get("coverage_tolerance_m", gsd)) * (1.0 if projected else 1.0 / 111_320.0)
+    geoms = np.array(gdf.geometry.values)
+    simple = shapely.coverage_simplify(geoms, tol)
+    ok = shapely.is_valid(simple) & ~shapely.is_empty(simple)
+    simple[~ok] = geoms[~ok]
+    gdf = gdf.copy()
+    gdf["geometry"] = simple
+    return gdf
 
 
 def remove_overlaps(g: gpd.GeoDataFrame, overlap: float = 0.3, min_area_m2: float = 200.0) -> gpd.GeoDataFrame:

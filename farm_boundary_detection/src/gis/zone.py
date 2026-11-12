@@ -126,7 +126,11 @@ def zone_product(model: gpd.GeoDataFrame, digitised: gpd.GeoDataFrame, zone: gpd
     m["source"] = "Model"
     m["farm_id"] = [f"{id_prefix}-{i + 1:05d}" for i in range(len(m))]
     id_col = next((c for c in ("FARM_ID", "farm_uid", "farm_id") if c in d), None)
-    d["farm_id"] = d[id_col].astype(str) if id_col else [f"DIG-{i + 1:05d}" for i in range(len(d))]
+    fallback = pd.Series([f"DIG-{i + 1:05d}" for i in range(len(d))], index=d.index)
+    if "farm_uid" in d:
+        fallback = d["farm_uid"].astype(str)
+    ids = d[id_col].where(d[id_col].notna(), fallback).astype(str) if id_col else fallback
+    d["farm_id"] = ids.where(~ids.isin(["", "nan", "None"]), fallback)
     d["source"] = "Digitized"
     d["review"] = "existing"
     d["score"] = np.nan

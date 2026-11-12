@@ -9,16 +9,7 @@ __pycache__/
 # secrets
 .env
 
-# large / licensed data: commercial imagery must never be committed (CSDA licence)
-laikipia-farm-mapper/data/imagery/
-laikipia-farm-mapper/data/tiles/
-laikipia-farm-mapper/data/tiles_*/
-laikipia-farm-mapper/data/*.zip
-laikipia-farm-mapper/data/models/
-laikipia-farm-mapper/data/models_*/
-laikipia-farm-mapper/data/context/
-laikipia-farm-mapper/data/cache/
-laikipia-farm-mapper/outputs/
+# imagery and rasters are licensed / large: never commit them
 *.tif
 *.tiff
 *.vrt

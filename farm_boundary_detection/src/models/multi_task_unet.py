@@ -200,8 +200,14 @@ class MultiTaskResUNet(nn.Module):
 
 
 def build_model(cfg, in_channels: int, rgb_indices: list[int] | None = None,
-                pretrained: bool | None = None) -> MultiTaskResUNet:
+                pretrained: bool | None = None, band_names: list[str] | None = None) -> nn.Module:
     mc = cfg.model
+    if mc.get("arch", "resunet") == "ftp_unet":
+        from .ftp_unet import FTPUnet, bgrn_indices
+        return FTPUnet(in_channels, bgrn_indices(in_channels, band_names),
+                       pretrained=mc.pretrained if pretrained is None else pretrained,
+                       second_window=mc.get("second_window", "copy"),
+                       input_upsample=int(mc.get("input_upsample", 1) or 1))
     return MultiTaskResUNet(
         in_channels=in_channels, encoder=mc.encoder, pretrained=mc.pretrained if pretrained is None else pretrained,
         decoder_channels=tuple(mc.decoder_channels), full_resolution_branch=mc.full_resolution_branch,
@@ -210,9 +216,14 @@ def build_model(cfg, in_channels: int, rgb_indices: list[int] | None = None,
         input_upsample=int(mc.get("input_upsample", 1) or 1))
 
 
-def model_kwargs(cfg, in_channels: int, rgb: list[int] | None) -> dict:
+def model_kwargs(cfg, in_channels: int, rgb: list[int] | None, band_names: list[str] | None = None) -> dict:
     """Everything needed to rebuild the network from a checkpoint (no download: pretrained=False)."""
     mc = cfg.model
+    if mc.get("arch", "resunet") == "ftp_unet":
+        from .ftp_unet import bgrn_indices
+        return {"arch": "ftp_unet", "in_channels": in_channels, "band_idx": bgrn_indices(in_channels, band_names),
+                "pretrained": False, "second_window": mc.get("second_window", "copy"),
+                "input_upsample": int(mc.get("input_upsample", 1) or 1)}
     return {"in_channels": in_channels, "encoder": mc.encoder, "pretrained": False,
             "decoder_channels": list(mc.decoder_channels), "full_resolution_branch": bool(mc.full_resolution_branch),
             "psp_pooling": bool(mc.psp_pooling), "condition_interior_on_boundary": bool(mc.condition_interior_on_boundary),
@@ -229,10 +240,15 @@ def load_checkpoint(path, device="cpu") -> dict:
         return torch.load(path, map_location=device)
 
 
-def load_model(path, device="cpu") -> tuple[MultiTaskResUNet, dict]:
+def load_model(path, device="cpu") -> tuple[nn.Module, dict]:
     ck = load_checkpoint(path, device)
     if "model_kwargs" not in ck:
         raise ValueError(f"{path} is not a checkpoint written by this project")
-    model = MultiTaskResUNet(**ck["model_kwargs"])
+    kw = dict(ck["model_kwargs"])
+    if kw.pop("arch", "resunet") == "ftp_unet":
+        from .ftp_unet import FTPUnet
+        model = FTPUnet(**kw)
+    else:
+        model = MultiTaskResUNet(**kw)
     model.load_state_dict(ck["state_dict"])
     return model.to(device).eval(), ck

@@ -99,6 +99,8 @@ patches:
   overwrite: true             # clear previous patches of the same output folder first
 
 normalization:
+  mode: zscore                # zscore = clip + z-score per band | scale = value / scale (for arch: ftp_unet)
+  scale: 10000.0              # PlanetScope surface reflectance DN -> reflectance
   clip_percentiles: [1, 99]   # per band, from training patches; values are clipped, then z-scored
   sample_patches: 300
 
@@ -111,9 +113,15 @@ augmentation:
   brightness: 0.10            # additive, in standard deviations
   contrast: 0.10              # multiplicative
   noise_std: 0.03
+  gain: 0.0                   # one random factor 1 +- gain for all bands (illumination / correction drift)
+  gamma: 0.0                  # per-band tone curve x^(1 +- gamma); only with normalization.mode: scale
 
 # ---------------------------------------------------------------- model
 model:
+  arch: resunet               # resunet = this project's ResNet U-Net | ftp_unet = Fields of the Planet U-Net
+                              # (EfficientNet-B3, pretrained on 3 m PlanetScope field boundaries; use with
+                              # normalization.mode: scale; needs segmentation-models-pytorch)
+  second_window: copy         # ftp_unet only: the model takes two seasons; copy = the same image twice | zeros
   encoder: resnet34           # resnet18 / resnet34 / resnet50 / resnet101 (torchvision)
   pretrained: true            # ImageNet weights; the first conv is adapted to the number of bands
   decoder_channels: [256, 128, 64, 32]
@@ -180,11 +188,16 @@ inference:
 postprocess:
   interior_threshold: 0.5     # extent: P(interior) above this
   seed_source: boundary       # boundary: P(int)*(1-P(bnd)) | distance | combined (need model.distance_head)
+                              # edt: as boundary, then each seed blob is split at its narrow necks (peaks of
+                              #      its distance transform): separates farms joined through a gap in a boundary
+  edt_h: 2.0                  # edt only: a neck must be this many pixels shallower than the peaks it separates
   seed_threshold: 0.5         # seeds: seed score above this
   boundary_threshold: 0.5     # seeds never include pixels with P(boundary) above this
   min_seed_px: 15             # smaller seeds would split one farm into several
   min_area_m2: 200            # 0.02 ha = 22 pixels (many plots are only 5-20 px wide)
   hole_area_m2: 200
-  simplify_m: 1.5             # half a pixel
+  simplify_m: 1.5             # half a pixel (only used when coverage_simplify is false)
+  coverage_simplify: true     # simplify all outlines together: a shared edge stays ONE line, so neighbouring
+  coverage_tolerance_m: 3.0   # polygons can never cross or overlap (needs shapely >= 2.1)
   block_px: 4096
   halo_px: 512                # farms larger than ~halo x 3 m may be cut by a block edge, then merged

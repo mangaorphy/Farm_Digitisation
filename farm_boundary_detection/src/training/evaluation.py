@@ -178,10 +178,10 @@ def _grid(cfg, cache, base, grid: dict) -> pd.DataFrame:
 def tune_postprocess(cfg, cache: dict, stage1: dict | None = None, stage2: dict | None = None) -> tuple[Config, pd.DataFrame]:
     """Two-stage search of the post-processing for the best object F1 (use VALIDATION patches only).
 
-    Stage 1: seed source x seed threshold x minimum seed size. Stage 2 (around the stage-1 winner): extent
+    Stage 1: seed source (incl. ``edt`` neck splitting) x seed threshold x minimum seed size. Stage 2 (around the stage-1 winner): extent
     threshold x boundary threshold x minimum farm area. Ranges are wide on purpose: the first round of tuning
     ended on the edges of a narrower grid."""
-    sources = ["boundary", "distance", "combined"] if cache.get("distance") else ["boundary"]
+    sources = ["boundary", "edt"] + (["distance", "combined"] if cache.get("distance") else [])
     stage1 = stage1 or {"seed_source": sources, "seed_threshold": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
                         "min_seed_px": [10, 25, 50, 100]}
     stage2 = stage2 or {"interior_threshold": [0.25, 0.3, 0.35, 0.4, 0.5], "boundary_threshold": [0.3, 0.5, 0.7],

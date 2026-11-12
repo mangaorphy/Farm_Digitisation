@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..data.dataset import load_patch_table, make_dataloader
+from ..data.dataset import load_norm_stats, load_patch_table, make_dataloader
 from ..models.multi_task_unet import build_model, load_checkpoint, model_kwargs
 from ..utils.helpers import get_device, read_json, rgb_indices, seed_everything, to_plain
 from .losses import MultiTaskLoss
@@ -66,12 +66,12 @@ class Trainer:
         self.out = Path(cfg.paths.models_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         table = load_patch_table(cfg)
-        self.norm_stats = read_json(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
+        self.norm_stats = load_norm_stats(cfg)
         self.train_loader = make_dataloader(cfg, "train", limit=tc.get("max_train_patches"), table=table)
         self.val_loader = make_dataloader(cfg, "val", shuffle=False, augment=False, table=table)
         in_ch = len(self.norm_stats["bands"])
         self.rgb = rgb_indices(in_ch, self.norm_stats.get("band_names"), cfg.imagery.get("rgb_bands"))
-        self.net = build_model(cfg, in_ch, self.rgb).to(self.device)  # the bare network (saved / loaded)
+        self.net = build_model(cfg, in_ch, self.rgb, band_names=self.norm_stats.get("band_names")).to(self.device)
         self.model = self.net
         if self.device.type == "cuda" and torch.cuda.device_count() > 1 and tc.get("multi_gpu", True):
             self.model = torch.nn.DataParallel(self.net)  # e.g. Kaggle "GPU T4 x2"
@@ -105,11 +105,13 @@ class Trainer:
             self._init_from(Path(tc.init_from))
         log.info("device %s | %d train / %d val patches | %d bands %s | encoder %s | AMP %s",
                  self.device, len(self.train_loader.dataset), len(self.val_loader.dataset), in_ch,
-                 self.norm_stats.get("band_names"), cfg.model.encoder, self.use_amp)
+                 self.norm_stats.get("band_names"),
+                 "FTP EfficientNet-B3 U-Net" if cfg.model.get("arch") == "ftp_unet" else cfg.model.encoder, self.use_amp)
 
     # ------------------------------------------------------------------ checkpoints
     def _meta(self) -> dict:
-        return {"model_kwargs": model_kwargs(self.cfg, len(self.norm_stats["bands"]), self.rgb),
+        return {"model_kwargs": model_kwargs(self.cfg, len(self.norm_stats["bands"]), self.rgb,
+                                             self.norm_stats.get("band_names")),
                 "normalization": self.norm_stats, "config": to_plain(self.cfg),
                 "bands": self.norm_stats["bands"], "gsd_m": self.norm_stats.get("gsd_m")}
 

@@ -316,3 +316,67 @@ def test_zone_product_drops_blobs_not_digitised():
     out = zone_product(model, dig, zone, tiles, max_area_ha=10, min_compact=0.1).to_crs(crs)
     assert sorted(out.farm_id.str[:3]) == ["AUT", "BIG"]
     assert abs(out[out.source == "Model"].area.iloc[0] - 1e4) < 1
+
+
+def test_ftp_unet_interface_and_probabilities():
+    """The 3-class network is exposed as (farm, boundary) logits: P(farm) = P(interior) + P(boundary)."""
+    import pytest
+    import torch
+    pytest.importorskip("segmentation_models_pytorch")
+    from src.models.ftp_unet import FTPUnet, bgrn_indices
+
+    assert bgrn_indices(8) == [1, 3, 5, 7] and bgrn_indices(4) == [0, 1, 2, 3]
+    assert bgrn_indices(5, ["nir", "x", "red", "green", "blue"]) == [4, 3, 2, 0]
+    m = FTPUnet(8, pretrained=False).eval()
+    x = torch.rand(2, 8, 70, 50) * 0.3
+    with torch.no_grad():
+        farm, bnd = m(x)
+        x4 = torch.nn.functional.pad(x[:, [1, 3, 5, 7]], (0, 14, 0, 26), mode="reflect")
+        p = m.net(torch.cat([x4, x4], 1))[..., :70, :50].softmax(1)
+    assert farm.shape == bnd.shape == (2, 1, 70, 50)
+    assert torch.allclose(torch.sigmoid(farm)[:, 0], p[:, 1] + p[:, 2], atol=1e-5)
+    assert torch.allclose(torch.sigmoid(bnd)[:, 0], p[:, 2], atol=1e-5)
+
+
+def test_edt_seeds_split_two_farms_joined_by_a_gap():
+    """Two squares whose boundary has a 2-px gap: plain seeds give one farm, edt seeds give two."""
+    import numpy as np
+    from src.gis.polygon_reconstruction import segment
+    from src.utils.helpers import Config
+
+    p_int = np.zeros((40, 70), np.float32); p_int[5:35, 5:65] = 0.95
+    p_bnd = np.zeros((40, 70), np.float32); p_bnd[5:35, 35] = 0.95; p_bnd[19:21, 35] = 0.0   # gap in the fence
+    base = dict(interior_threshold=0.5, seed_threshold=0.5, boundary_threshold=0.5, min_seed_px=10, min_area_m2=0)
+    one = segment(p_int, p_bnd, Config({**base, "seed_source": "boundary"}), 3.0)
+    two = segment(p_int, p_bnd, Config({**base, "seed_source": "edt", "edt_h": 2.0}), 3.0)
+    assert one.max() == 1 and two.max() == 2
+    assert two[20, 10] != two[20, 60]
+
+
+def test_simplify_together_neighbours_never_cross():
+    """Staircase edge shared by two farms: simplified together they still do not overlap; separately they do."""
+    import geopandas as gpd
+    import numpy as np
+    import shapely
+    from rasterio.features import shapes
+    from rasterio.transform import from_origin
+    from shapely.geometry import shape
+    from src.gis.polygon_reconstruction import simplify_together
+    from src.utils.helpers import Config
+
+    if not hasattr(shapely, "coverage_simplify"):
+        return
+    lab = np.zeros((60, 60), np.int32)
+    yy, xx = np.mgrid[0:60, 0:60]
+    lab[(yy > 5) & (yy < 55) & (xx > 5) & (xx < 55)] = 1
+    lab[(lab == 1) & (xx > 10 + 0.7 * yy)] = 2                    # diagonal (staircase) shared edge
+    tr = from_origin(260000, 9990180, 3, 3)
+    geoms = [shape(g) for g, v in shapes(lab, mask=lab > 0, transform=tr, connectivity=4)]
+    gdf = gpd.GeoDataFrame({"score": [0.9, 0.8]}, geometry=geoms, crs="EPSG:32737")
+    pc = Config({"coverage_simplify": True, "coverage_tolerance_m": 4.0, "simplify_m": 3.0})
+    out = simplify_together(gdf.copy(), pc, 3.0)
+    assert out.geometry.iloc[0].intersection(out.geometry.iloc[1]).area < 1e-6
+    assert sum(len(g.exterior.coords) for g in out.geometry) < 0.5 * sum(len(g.exterior.coords) for g in geoms)
+    assert abs(out.area.sum() - gdf.area.sum()) < 0.02 * gdf.area.sum()
+    sep = gdf.geometry.simplify(3.0)
+    assert sep.iloc[0].intersection(sep.iloc[1]).area > 1.0        # the old way: neighbours cross

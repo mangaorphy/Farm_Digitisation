@@ -66,6 +66,22 @@ class Normalizer:
         return x.astype(np.float32), ok
 
 
+def load_norm_stats(cfg, mode: str | None = None) -> dict:
+    """Normalisation statistics for training. ``normalization.mode``: ``zscore`` = per-band clip + z-score from
+    ``metadata/normalization.json``; ``scale`` = value / ``normalization.scale`` (reflectance, what models
+    pretrained on PlanetScope surface reflectance expect), written in the same clip / mean / std form so the
+    ``Normalizer``, checkpoints and inference need no special case. ``data_std`` keeps the real band spread."""
+    stats = read_json(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
+    mode = mode or cfg.normalization.get("mode", "zscore")
+    if mode == "scale":
+        n, s = len(stats["bands"]), float(cfg.normalization.get("scale", 10000.0))
+        stats = {**stats, "data_std": list(stats["std"]), "mode": "scale", "clip_low": [0.0] * n,
+                 "clip_high": [65535.0] * n, "mean": [0.0] * n, "std": [s] * n}
+    elif mode != "zscore":
+        raise ValueError(f"normalization.mode must be zscore or scale, not {mode!r}")
+    return stats
+
+
 def boundary_weight_map(boundary: np.ndarray, w0: float, sigma_px: float) -> np.ndarray:
     """w = 1 + w0 * exp(-d^2 / (2 sigma^2)), d = distance (px) to the nearest boundary pixel.
 
@@ -161,6 +177,11 @@ class FarmPatchDataset(Dataset):
         b = rng.uniform(-a.get("brightness", 0), a.get("brightness", 0), (c, 1, 1)).astype(np.float32)
         k = rng.uniform(1 - a.get("contrast", 0), 1 + a.get("contrast", 0), (c, 1, 1)).astype(np.float32)
         y = x * k + b
+        if a.get("gain", 0):      # one factor for all bands: illumination / atmospheric-correction drift
+            y = y * float(rng.uniform(1 - a["gain"], 1 + a["gain"]))
+        if a.get("gamma", 0) and float(x.min()) >= 0:  # per-band tone curve (reflectance-scaled input only)
+            g = rng.uniform(1 - a["gamma"], 1 + a["gamma"], (c, 1, 1)).astype(np.float32)
+            y = np.clip(y, 1e-6, None) ** g
         if a.get("noise_std", 0):
             y = y + rng.normal(0, a["noise_std"], x.shape).astype(np.float32)
         return np.where(ok[None], y, 0.0).astype(np.float32)
@@ -213,8 +234,14 @@ def make_dataset(cfg, split: str, augment: bool | None = None, table: pd.DataFra
         ids = ids[: int(limit)]
     if not ids:
         raise ValueError(f"no {split} patches in {cfg.paths.processed_dir}/metadata/patches.csv")
-    norm = Normalizer.from_file(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
+    stats = load_norm_stats(cfg)
+    norm = Normalizer(stats)
     aug = dict(cfg.augmentation) if (augment if augment is not None else split == "train") else None
+    if aug and stats.get("mode") == "scale":
+        # brightness / noise are given in standard deviations of the data: convert to reflectance units
+        unit = float(np.mean(stats["data_std"]) / stats["std"][0])
+        aug["brightness"] = float(aug.get("brightness", 0)) * unit
+        aug["noise_std"] = float(aug.get("noise_std", 0)) * unit
     return FarmPatchDataset(cfg.paths.processed_dir, ids, norm, aug, dict(cfg.loss.get("boundary_aware") or {}),
                             int(cfg.project.seed), distance=bool(cfg.model.get("distance_head", False)))
 
