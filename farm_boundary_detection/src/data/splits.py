@@ -77,6 +77,8 @@ class GeoSplit:
         farm_blocks = [k for k in counts]
         if len(farm_blocks) >= 3:
             for s in SPLITS:
+                if self.fractions[s] <= 0:      # e.g. cross-validation: no test split wanted
+                    continue
                 if not any(self.assignment[k] == s for k in farm_blocks):
                     donor = max(SPLITS, key=lambda n: sum(1 for k in farm_blocks if self.assignment[k] == n))
                     smallest = min((k for k in farm_blocks if self.assignment[k] == donor), key=lambda k: counts[k])

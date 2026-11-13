@@ -318,26 +318,6 @@ def test_zone_product_drops_blobs_not_digitised():
     assert abs(out[out.source == "Model"].area.iloc[0] - 1e4) < 1
 
 
-def test_ftp_unet_interface_and_probabilities():
-    """The 3-class network is exposed as (farm, boundary) logits: P(farm) = P(interior) + P(boundary)."""
-    import pytest
-    import torch
-    pytest.importorskip("segmentation_models_pytorch")
-    from src.models.ftp_unet import FTPUnet, bgrn_indices
-
-    assert bgrn_indices(8) == [1, 3, 5, 7] and bgrn_indices(4) == [0, 1, 2, 3]
-    assert bgrn_indices(5, ["nir", "x", "red", "green", "blue"]) == [4, 3, 2, 0]
-    m = FTPUnet(8, pretrained=False).eval()
-    x = torch.rand(2, 8, 70, 50) * 0.3
-    with torch.no_grad():
-        farm, bnd = m(x)
-        x4 = torch.nn.functional.pad(x[:, [1, 3, 5, 7]], (0, 14, 0, 26), mode="reflect")
-        p = m.net(torch.cat([x4, x4], 1))[..., :70, :50].softmax(1)
-    assert farm.shape == bnd.shape == (2, 1, 70, 50)
-    assert torch.allclose(torch.sigmoid(farm)[:, 0], p[:, 1] + p[:, 2], atol=1e-5)
-    assert torch.allclose(torch.sigmoid(bnd)[:, 0], p[:, 2], atol=1e-5)
-
-
 def test_edt_seeds_split_two_farms_joined_by_a_gap():
     """Two squares whose boundary has a 2-px gap: plain seeds give one farm, edt seeds give two."""
     import numpy as np
@@ -423,3 +403,81 @@ def test_regularize_straight_separated_aligned():
         ang = math.degrees(math.atan2(c[1][1] - c[0][1], c[1][0] - c[0][0])) % 90
         assert min(abs(ang - 30), abs(ang - 30 + 90), abs(ang - 30 - 90)) < 2  # follows the 30 deg field grid
     assert all(abs(o2.area - o1.area) / o1.area < 0.15 for o1, o2 in zip(model.geometry, out.geometry))
+
+
+def test_separation_strip_marks_only_gaps_between_two_farms():
+    import numpy as np
+    from src.data.dataset import separation_strip
+
+    inst = np.zeros((20, 40), np.int32)
+    inst[2:18, 2:19] = 1          # farm 1
+    inst[2:18, 21:38] = 2         # farm 2, 2-px path between them (columns 19-20)
+    s = separation_strip(inst, 5)
+    assert s[5:15, 19:21].all()                      # the path between the farms
+    assert not s[inst > 0].any()                     # never inside a farm
+    assert not s[0, :].any() or s[0, 19:21].any()    # outer edges: only near the path
+    assert not s[10, 0:2].any() and not s[10, 38:40].any()   # outer side of one farm: not a strip
+
+
+def test_softmax3_head_outputs_and_loss():
+    """3-class head: P(farm) = P(interior) + P(boundary), P(boundary) exact; loss finite, trains, honours valid."""
+    import torch
+    from src.models.multi_task_unet import MultiTaskResUNet
+    from src.training.losses import MultiTaskLoss
+    from src.utils.helpers import load_config
+
+    m = MultiTaskResUNet(8, "resnet18", pretrained=False, decoder_channels=(32, 16, 16, 8), head="softmax3")
+    x = torch.randn(2, 8, 64, 48)
+    farm, bnd, z = m(x)
+    p = z.softmax(1)
+    assert farm.shape == bnd.shape == (2, 1, 64, 48) and z.shape == (2, 3, 64, 48)
+    assert torch.allclose(torch.sigmoid(farm)[:, 0], p[:, 1] + p[:, 2], atol=1e-5)
+    assert torch.allclose(torch.sigmoid(bnd)[:, 0], p[:, 2], atol=1e-5)
+    cfg = load_config(None, ["model.head=softmax3", "loss.separation.enabled=true"])
+    loss_fn = MultiTaskLoss(cfg)
+    inter = torch.zeros(2, 1, 64, 48); inter[:, :, 10:40, 5:20] = 1; inter[:, :, 10:40, 25:45] = 1
+    bnd_t = torch.zeros_like(inter); bnd_t[:, :, 10:40, 20:25] = 1
+    batch = {"interior_mask": inter, "boundary_mask": bnd_t, "valid_mask": torch.ones_like(inter),
+             "weight_map": torch.ones_like(inter)}
+    loss, parts = loss_fn(farm, bnd, batch, z)
+    assert torch.isfinite(loss) and {"class_ce", "class_logcosh_dice"} <= set(parts)
+    loss.backward()
+    assert any(p_.grad is not None and p_.grad.abs().sum() > 0 for p_ in m.class_head.parameters())
+    batch0 = {**batch, "valid_mask": torch.zeros_like(inter)}       # nothing valid -> no signal
+    l0, _ = loss_fn(farm.detach(), bnd.detach(), batch0, z.detach())
+    assert float(l0) < 1e-3
+
+
+def test_assign_folds_balanced_and_complete():
+    """Every farm block gets exactly one fold; folds hold similar numbers of farms."""
+    import geopandas as gpd
+    import numpy as np
+    from shapely.geometry import Point
+    from src.training.crossval import assign_folds
+
+    rng = np.random.default_rng(1)
+    pts = [Point(260000 + x, 9990000 + y) for x, y in rng.uniform(0, 6000, (400, 2))]
+    labels = gpd.GeoDataFrame(geometry=[p.buffer(10) for p in pts], crs="EPSG:32737")
+    folds = assign_folds(labels, "EPSG:32737", 1500, 4, seed=3)
+    keys = [(int(np.floor(p.x / 1500)), int(np.floor(p.y / 1500))) for p in pts]
+    assert set(folds) == set(keys) and set(folds.values()) == {0, 1, 2, 3}
+    per = np.bincount([folds[k] for k in keys], minlength=4)
+    assert per.sum() == 400 and per.max() - per.min() <= 0.25 * per.mean()
+
+
+def test_regularize_notched_by_neighbour_becomes_rectangle_inside():
+    """A lower-scoring farm overlapped at one corner by a neighbour: it becomes a clean rectangle that still keeps
+    the gap (never re-enters the neighbour's area)."""
+    import geopandas as gpd
+    from shapely.geometry import box
+    from src.gis.regularize import regularize
+
+    o = (260000, 9990000)
+    a = box(o[0], o[1], o[0] + 60, o[1] + 40)                    # confident farm
+    b = box(o[0] + 50, o[1] + 30, o[0] + 130, o[1] + 100)        # overlaps a's corner
+    g = gpd.GeoDataFrame({"score": [0.9, 0.7]}, geometry=[a, b], crs="EPSG:32737")
+    out = regularize(g, {"gap_m": 1.0, "min_area_m2": 50})
+    ga, gb = out.geometry.iloc[0], out.geometry.iloc[1]
+    assert len(gb.exterior.coords) == 5                          # rectangle, not an L with a notch
+    assert ga.distance(gb) >= 0.99                               # gap kept
+    assert gb.area >= 0.85 * (b.area - b.intersection(a.buffer(1)).area)

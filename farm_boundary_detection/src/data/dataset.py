@@ -66,21 +66,9 @@ class Normalizer:
         return x.astype(np.float32), ok
 
 
-def load_norm_stats(cfg, mode: str | None = None) -> dict:
-    """Normalisation statistics for training. ``normalization.mode``: ``zscore`` = per-band clip + z-score from
-    ``metadata/normalization.json``; ``scale`` = value / ``normalization.scale`` (reflectance, what models
-    pretrained on PlanetScope surface reflectance expect), written in the same clip / mean / std form so the
-    ``Normalizer``, checkpoints and inference need no special case. ``data_std`` keeps the real band spread."""
-    stats = read_json(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
-    mode = mode or cfg.normalization.get("mode", "zscore")
-    if mode == "scale":
-        n, s = len(stats["bands"]), float(cfg.normalization.get("scale", 10000.0))
-        stats = {**stats, "data_std": list(stats["std"]), "mode": "scale", "clip_low": [0.0] * n,
-                 "clip_high": [65535.0] * n, "mean": [0.0] * n, "std": [s] * n}
-    elif mode != "zscore":
-        raise ValueError(f"normalization.mode must be zscore or scale, not {mode!r}")
-    return stats
-
+def load_norm_stats(cfg) -> dict:
+    """Normalisation statistics of the training patches (``metadata/normalization.json``)."""
+    return read_json(Path(cfg.paths.processed_dir) / "metadata" / "normalization.json")
 
 def boundary_weight_map(boundary: np.ndarray, w0: float, sigma_px: float) -> np.ndarray:
     """w = 1 + w0 * exp(-d^2 / (2 sigma^2)), d = distance (px) to the nearest boundary pixel.
@@ -116,12 +104,26 @@ def instance_distance(instance: np.ndarray) -> np.ndarray:
     return out
 
 
+def separation_strip(instance: np.ndarray, window_px: int = 5) -> np.ndarray:
+    """Background pixels lying between two DIFFERENT farms (both within the ``window_px`` square around the pixel):
+    the paths, hedges and field edges that keep neighbouring farms apart. A model that paints them as farm merges
+    the neighbours into one polygon (round-3 error analysis: 55% of these pixels were predicted as farm, and 43% of
+    farms were merged with a neighbour)."""
+    inst = instance.astype(np.int64)
+    if inst.max() == 0:
+        return np.zeros(inst.shape, bool)
+    big = inst.max() + 1
+    mx = ndi.maximum_filter(inst, size=window_px)
+    mn = ndi.minimum_filter(np.where(inst > 0, inst, big), size=window_px)
+    return (inst == 0) & (mx > 0) & (mn < big) & (mx != mn)
+
+
 class FarmPatchDataset(Dataset):
     """Patches of one split. ``augment`` = training augmentations (config ``augmentation``)."""
 
     def __init__(self, processed_dir: str | Path, patch_ids: list[str], normalizer: Normalizer,
                  augment: dict | None = None, boundary_aware: dict | None = None, seed: int = 0,
-                 distance: bool = False):
+                 distance: bool = False, separation: dict | None = None):
         self.dir = Path(processed_dir)
         self.ids = list(patch_ids)
         if not self.ids:
@@ -131,6 +133,7 @@ class FarmPatchDataset(Dataset):
         self.ba = boundary_aware or {}
         self.seed = seed
         self.distance = distance
+        self.sep = separation if separation and separation.get("enabled", False) else None
         missing = [p for p in self.ids[:20] if not (self.dir / "images" / f"{p}.tif").exists()]
         if missing:
             raise FileNotFoundError(f"patch files missing in {self.dir}/images, e.g. {missing[:3]}")
@@ -145,7 +148,7 @@ class FarmPatchDataset(Dataset):
     def load_raw(self, pid: str) -> dict[str, np.ndarray]:
         raw = {"image": self._read("images", pid), "interior": self._read("interior_masks", pid)[0],
                "boundary": self._read("boundary_masks", pid)[0], "valid": self._read("valid_masks", pid)[0]}
-        if self.distance:
+        if self.distance or self.sep:
             raw["instance"] = self._read("instance_masks", pid)[0]
         return raw
 
@@ -179,9 +182,6 @@ class FarmPatchDataset(Dataset):
         y = x * k + b
         if a.get("gain", 0):      # one factor for all bands: illumination / atmospheric-correction drift
             y = y * float(rng.uniform(1 - a["gain"], 1 + a["gain"]))
-        if a.get("gamma", 0) and float(x.min()) >= 0:  # per-band tone curve (reflectance-scaled input only)
-            g = rng.uniform(1 - a["gamma"], 1 + a["gamma"], (c, 1, 1)).astype(np.float32)
-            y = np.clip(y, 1e-6, None) ** g
         if a.get("noise_std", 0):
             y = y + rng.normal(0, a["noise_std"], x.shape).astype(np.float32)
         return np.where(ok[None], y, 0.0).astype(np.float32)
@@ -200,7 +200,14 @@ class FarmPatchDataset(Dataset):
             # image pixels outside the labelled region are still real context: augment every DATA pixel
             x = self._radiometric(x, data.astype(bool), rng, self.aug)
             valid = (valid.astype(bool) & data.astype(bool)).astype(np.uint8)
+        strip = None
+        if self.sep:    # the strips between neighbouring farms: part of the boundary target, and costly to fill
+            strip = separation_strip(instance, int(self.sep.get("window_px", 5))) & valid.astype(bool)
+            if self.sep.get("as_boundary", True):
+                boundary = (boundary.astype(bool) | strip).astype(np.uint8)
         weight = boundary_weight_map(boundary, float(self.ba.get("w0", 0)), float(self.ba.get("sigma_px", 2.0)))
+        if strip is not None and float(self.sep.get("weight", 0)) > 0:
+            weight = np.where(strip, weight + float(self.sep["weight"]), weight).astype(np.float32)
         item = {
             "image": torch.from_numpy(x.astype(np.float32)),
             "interior_mask": torch.from_numpy((interior > 0).astype(np.float32))[None],
@@ -237,13 +244,9 @@ def make_dataset(cfg, split: str, augment: bool | None = None, table: pd.DataFra
     stats = load_norm_stats(cfg)
     norm = Normalizer(stats)
     aug = dict(cfg.augmentation) if (augment if augment is not None else split == "train") else None
-    if aug and stats.get("mode") == "scale":
-        # brightness / noise are given in standard deviations of the data: convert to reflectance units
-        unit = float(np.mean(stats["data_std"]) / stats["std"][0])
-        aug["brightness"] = float(aug.get("brightness", 0)) * unit
-        aug["noise_std"] = float(aug.get("noise_std", 0)) * unit
     return FarmPatchDataset(cfg.paths.processed_dir, ids, norm, aug, dict(cfg.loss.get("boundary_aware") or {}),
-                            int(cfg.project.seed), distance=bool(cfg.model.get("distance_head", False)))
+                            int(cfg.project.seed), distance=bool(cfg.model.get("distance_head", False)),
+                            separation=dict(cfg.loss.get("separation") or {}))
 
 
 def make_dataloader(cfg, split: str, shuffle: bool | None = None, augment: bool | None = None,

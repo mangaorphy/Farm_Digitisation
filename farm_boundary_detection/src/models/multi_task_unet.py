@@ -118,7 +118,7 @@ class MultiTaskResUNet(nn.Module):
                  decoder_channels=(256, 128, 64, 32), full_resolution_branch: bool = True, psp_pooling: bool = True,
                  condition_interior_on_boundary: bool = True, dropout: float = 0.0,
                  rgb_indices: list[int] | None = None, distance_head: bool = False,
-                 input_upsample: int = 1):
+                 input_upsample: int = 1, head: str = "two"):
         super().__init__()
         if encoder not in ENCODERS:
             raise ValueError(f"encoder must be one of {sorted(ENCODERS)}, got {encoder!r}")
@@ -127,6 +127,14 @@ class MultiTaskResUNet(nn.Module):
         self.in_channels = in_channels
         self.condition = condition_interior_on_boundary
         self.has_distance = bool(distance_head)
+        if head not in ("two", "softmax3"):
+            raise ValueError(f"model.head must be two or softmax3, not {head!r}")
+        if head == "softmax3" and self.has_distance:
+            raise ValueError("model.head: softmax3 cannot be combined with model.distance_head")
+        # two     : two sigmoid outputs, P(farm) (outline included) and P(boundary)
+        # softmax3: one softmax over 3 exclusive classes (background, farm interior, boundary) as in PRUE
+        #           (CVPR 2026); returned as the same two logits plus the 3-class logits for the loss
+        self.head = head
         self.input_upsample = int(input_upsample or 1)  # >1: the image is enlarged (bilinear) before the network
         # and the outputs are averaged back: small farms span more encoder pixels; targets and outputs stay at 3 m
         weights = "DEFAULT" if pretrained else None
@@ -153,10 +161,13 @@ class MultiTaskResUNet(nn.Module):
         self.dec2 = DecoderStage(d3, 64, d4, 0.0)
         self.full_res = nn.Sequential(ConvBNReLU(in_channels, 32), ConvBNReLU(32, 32)) if full_resolution_branch else None
         self.dec1 = ResidualBlock(d4 + (32 if full_resolution_branch else 0), d4)
-        self.boundary_head = Head(d4, d4)
-        self.distance_head = Head(d4, d4) if self.has_distance else None
-        n_cond = (1 + int(self.has_distance)) if self.condition else 0
-        self.interior_head = Head(d4 + n_cond, d4)
+        if head == "softmax3":
+            self.class_head = nn.Sequential(ConvBNReLU(d4, d4), nn.Conv2d(d4, 3, 1))
+        else:
+            self.boundary_head = Head(d4, d4)
+            self.distance_head = Head(d4, d4) if self.has_distance else None
+            n_cond = (1 + int(self.has_distance)) if self.condition else 0
+            self.interior_head = Head(d4 + n_cond, d4)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         s = self.input_upsample
@@ -185,6 +196,11 @@ class MultiTaskResUNet(nn.Module):
         if self.full_res is not None:
             d = torch.cat([d, self.full_res(x)], 1)
         d = self.dec1(d)
+        if self.head == "softmax3":
+            z = self.class_head(d)[..., :h, :w].float()                      # background, interior, boundary
+            farm = torch.logsumexp(z[:, 1:3], 1, keepdim=True) - z[:, 0:1]   # logit P(interior or boundary)
+            boundary = z[:, 2:3] - torch.logsumexp(z[:, 0:2], 1, keepdim=True)  # logit P(boundary)
+            return farm, boundary, z
         boundary_logits = self.boundary_head(d)
         distance_logits = self.distance_head(d) if self.distance_head is not None else None
         if self.condition:
@@ -200,36 +216,25 @@ class MultiTaskResUNet(nn.Module):
 
 
 def build_model(cfg, in_channels: int, rgb_indices: list[int] | None = None,
-                pretrained: bool | None = None, band_names: list[str] | None = None) -> nn.Module:
+                pretrained: bool | None = None) -> MultiTaskResUNet:
     mc = cfg.model
-    if mc.get("arch", "resunet") == "ftp_unet":
-        from .ftp_unet import FTPUnet, bgrn_indices
-        return FTPUnet(in_channels, bgrn_indices(in_channels, band_names),
-                       pretrained=mc.pretrained if pretrained is None else pretrained,
-                       second_window=mc.get("second_window", "copy"),
-                       input_upsample=int(mc.get("input_upsample", 1) or 1))
     return MultiTaskResUNet(
         in_channels=in_channels, encoder=mc.encoder, pretrained=mc.pretrained if pretrained is None else pretrained,
         decoder_channels=tuple(mc.decoder_channels), full_resolution_branch=mc.full_resolution_branch,
         psp_pooling=mc.psp_pooling, condition_interior_on_boundary=mc.condition_interior_on_boundary,
         dropout=float(mc.get("dropout", 0.0)), rgb_indices=rgb_indices, distance_head=bool(mc.get("distance_head", False)),
-        input_upsample=int(mc.get("input_upsample", 1) or 1))
+        input_upsample=int(mc.get("input_upsample", 1) or 1), head=str(mc.get("head", "two")))
 
 
-def model_kwargs(cfg, in_channels: int, rgb: list[int] | None, band_names: list[str] | None = None) -> dict:
+def model_kwargs(cfg, in_channels: int, rgb: list[int] | None) -> dict:
     """Everything needed to rebuild the network from a checkpoint (no download: pretrained=False)."""
     mc = cfg.model
-    if mc.get("arch", "resunet") == "ftp_unet":
-        from .ftp_unet import bgrn_indices
-        return {"arch": "ftp_unet", "in_channels": in_channels, "band_idx": bgrn_indices(in_channels, band_names),
-                "pretrained": False, "second_window": mc.get("second_window", "copy"),
-                "input_upsample": int(mc.get("input_upsample", 1) or 1)}
     return {"in_channels": in_channels, "encoder": mc.encoder, "pretrained": False,
             "decoder_channels": list(mc.decoder_channels), "full_resolution_branch": bool(mc.full_resolution_branch),
             "psp_pooling": bool(mc.psp_pooling), "condition_interior_on_boundary": bool(mc.condition_interior_on_boundary),
             "dropout": float(mc.get("dropout", 0.0)), "rgb_indices": rgb,
             "distance_head": bool(mc.get("distance_head", False)),
-            "input_upsample": int(mc.get("input_upsample", 1) or 1)}
+            "input_upsample": int(mc.get("input_upsample", 1) or 1), "head": str(mc.get("head", "two"))}
 
 
 def load_checkpoint(path, device="cpu") -> dict:
@@ -240,15 +245,10 @@ def load_checkpoint(path, device="cpu") -> dict:
         return torch.load(path, map_location=device)
 
 
-def load_model(path, device="cpu") -> tuple[nn.Module, dict]:
+def load_model(path, device="cpu") -> tuple[MultiTaskResUNet, dict]:
     ck = load_checkpoint(path, device)
     if "model_kwargs" not in ck:
         raise ValueError(f"{path} is not a checkpoint written by this project")
-    kw = dict(ck["model_kwargs"])
-    if kw.pop("arch", "resunet") == "ftp_unet":
-        from .ftp_unet import FTPUnet
-        model = FTPUnet(**kw)
-    else:
-        model = MultiTaskResUNet(**kw)
+    model = MultiTaskResUNet(**ck["model_kwargs"])
     model.load_state_dict(ck["state_dict"])
     return model.to(device).eval(), ck

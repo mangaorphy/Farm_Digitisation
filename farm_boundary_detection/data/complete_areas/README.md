@@ -5,7 +5,8 @@ farm", which is why it draws loose shapes over bush, riverine vegetation and ran
 
 To fix that, draw a few large polygons in Google Earth Pro over land where there are **no farms at all** (bush,
 forest, ranch, conservancy), or over blocks where **every** farm is already digitised. Save them as one file,
-`no_farm_areas.kmz`, in this folder, commit and push. The round-3 notebook picks it up automatically.
+`no_farm_areas.kmz`, in this folder, commit and push. `notebooks/kaggle_zone.ipynb` picks it up automatically
+(it sets `paths.complete_areas`).
 
 Ten to twenty polygons of 0.5-3 km across, spread over the area, are enough. They must overlap the Planet imagery
-(the area within about 500 m of digitised farms, and the Mutara zone). Do not include any undigitised farm.
+(the area being mapped). Do not include any undigitised farm.

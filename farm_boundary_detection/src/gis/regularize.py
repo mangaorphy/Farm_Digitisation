@@ -11,9 +11,14 @@ step, applied to model polygons only, makes each farm look like a hand-digitised
 2. **straight edges** - in that direction, the polygon becomes a rectangle if a rectangle of the same area fits it
    (IoU >= ``rect_min_iou``); otherwise the outline is simplified, its edges snapped to the direction or the
    perpendicular (within ``ortho_angle_deg``), short clipped corners removed (``chamfer_m``) and the corners
-   rebuilt where the straight edges meet, spikes thinner than ``spike_m`` trimmed; a shape that no longer matches the traced one (IoU < ``min_iou``)
-   falls back to the plainly simplified outline;
-3. **no overlaps** - most confident polygon first; a straightened polygon gives up any area already taken;
+   rebuilt where the straight edges meet, spikes thinner than ``spike_m`` trimmed. If that no longer matches the
+   traced shape (IoU < ``min_iou``) it is tried once more with coarser simplification (``coarse_simplify_m``,
+   IoU >= ``coarse_min_iou``); a right-angled shape with more than ``max_corners`` corners (a staircase along a
+   slanted edge) is not accepted; an irregular plot that fits no right-angled shape gets straight sides at any angle
+   (coarse simplification), never a wiggly traced outline;
+3. **no overlaps** - most confident polygon first; a straightened polygon gives up any area already taken; if that
+   leaves a notched, nearly rectangular shape, it becomes the largest rectangle that fits inside what is left
+   (when that keeps >= ``inscribed_min_share`` of the area), so the gap and the no-overlap rule still hold;
 4. **a gap between neighbours** (``gap_m``) - every farm has its own outline.
 
 Digitised farms are never changed.
@@ -31,7 +36,8 @@ from shapely.geometry import Polygon, box
 log = logging.getLogger(__name__)
 
 DEFAULTS = {"enabled": True, "orientation_radius_m": 150.0, "rect_min_iou": 0.72, "ortho_angle_deg": 20.0,
-            "simplify_m": 3.0, "chamfer_m": 7.0, "spike_m": 3.0, "gap_m": 1.0, "min_iou": 0.70, "min_area_m2": 100.0}
+            "simplify_m": 3.0, "chamfer_m": 7.0, "spike_m": 3.0,
+            "coarse_simplify_m": 6.0, "coarse_min_iou": 0.65, "max_corners": 10, "inscribed_min_share": 0.85, "gap_m": 1.0, "min_iou": 0.70, "min_area_m2": 100.0}
 
 
 def _largest(geom) -> Polygon:
@@ -162,6 +168,47 @@ def _orthogonal(rot: Polygon, simplify_m: float, angle_deg: float, chamfer_m: fl
     return out if out.is_valid else _largest(out.buffer(0))
 
 
+def inscribed_rectangle(geom: Polygon, theta: float, res: float = 1.0) -> Polygon:
+    """Largest rectangle in direction ``theta`` lying inside ``geom`` (grid search at ``res`` metres, the classic
+    largest-rectangle-in-a-histogram method on the rasterised shape, then shrunk until strictly inside)."""
+    from rasterio.features import rasterize
+    from rasterio.transform import from_origin
+
+    origin = geom.centroid
+    rot = affinity.rotate(geom, -theta, origin=origin)
+    x0, y0, x1, y1 = rot.bounds
+    w, h = int(math.ceil((x1 - x0) / res)), int(math.ceil((y1 - y0) / res))
+    if w < 2 or h < 2 or w * h > 4_000_000:
+        return Polygon()
+    grid = rasterize([rot], out_shape=(h, w), transform=from_origin(x0, y1, res, res), fill=0, default_value=1,
+                     dtype="uint8").astype(bool)
+    heights = np.zeros(w, int)
+    best = (0, 0, 0, 0, 0)                      # area, row, col_start, col_end, height
+    for r in range(h):
+        heights = np.where(grid[r], heights + 1, 0)
+        stack: list[int] = []
+        for c in range(w + 1):
+            cur = heights[c] if c < w else 0
+            while stack and heights[stack[-1]] >= cur:
+                top = stack.pop()
+                left = stack[-1] + 1 if stack else 0
+                area = heights[top] * (c - left)
+                if area > best[0]:
+                    best = (area, r, left, c, heights[top])
+            stack.append(c)
+    area, r, c0, c1, hh = best
+    if area == 0:
+        return Polygon()
+    rect = box(x0 + c0 * res, y1 - (r + 1) * res, x0 + c1 * res, y1 - (r + 1 - hh) * res)
+    for _ in range(4):                          # pixel-centre sampling can overshoot by half a cell
+        if rect.within(rot):
+            return affinity.rotate(rect, theta, origin=origin)
+        rect = rect.buffer(-res / 2, join_style="mitre")
+        if rect.is_empty:
+            return Polygon()
+    return Polygon()
+
+
 def straighten(poly: Polygon, theta: float, rc: dict) -> Polygon:
     """One polygon -> straight-edged version in direction ``theta`` (degrees)."""
     if poly.is_empty or poly.area <= 0:
@@ -169,21 +216,26 @@ def straighten(poly: Polygon, theta: float, rc: dict) -> Polygon:
     poly = _largest(poly.buffer(0))
     origin = poly.centroid
     rot = affinity.rotate(poly, -theta, origin=origin)
-    best = None
-    for cand in (_rectangle(rot), _orthogonal(rot, float(rc["simplify_m"]), float(rc["ortho_angle_deg"]),
-                                                float(rc["chamfer_m"]))):
+    coarse = float(rc["coarse_simplify_m"])
+    tries = (  # (candidate, IoU it must reach with the traced shape); first acceptable one wins
+        (lambda: _rectangle(rot), float(rc["rect_min_iou"])),
+        (lambda: _orthogonal(rot, float(rc["simplify_m"]), float(rc["ortho_angle_deg"]), float(rc["chamfer_m"])),
+         float(rc["min_iou"])),
+        (lambda: _orthogonal(rot, coarse, float(rc["ortho_angle_deg"]), 2 * float(rc["chamfer_m"])),
+         float(rc["coarse_min_iou"])),
+    )
+    for make, need in tries:
+        cand = make()
         if cand.is_empty or not cand.is_valid:
             continue
         if len(cand.exterior.coords) > 5:   # remove thin spikes where two snapped edges meet at a sharp angle
             cand = _open(cand, float(rc["spike_m"]))
-        iou = _iou(cand, rot)
-        need = float(rc["rect_min_iou"]) if len(cand.exterior.coords) == 5 else float(rc["min_iou"])
-        if iou >= need:
-            best = cand
-            break
-    if best is None:
-        return _open(poly.simplify(float(rc["simplify_m"]), preserve_topology=True), float(rc["spike_m"]))
-    return affinity.rotate(best, theta, origin=origin)
+        if len(cand.exterior.coords) - 1 > int(rc["max_corners"]):   # a staircase along a slanted edge: not wanted
+            continue
+        if _iou(cand, rot) >= need:
+            return affinity.rotate(cand, theta, origin=origin)
+    # no right-angled shape fits (irregular plot): straight sides at any angle, no wiggles
+    return _open(poly.simplify(coarse, preserve_topology=True), float(rc["spike_m"]))
 
 
 def regularize(model: gpd.GeoDataFrame, rc: dict | None = None, taken=None,
@@ -219,6 +271,10 @@ def regularize(model: gpd.GeoDataFrame, rc: dict | None = None, taken=None,
                     geom = geom.difference(ring)
         if not geom.is_empty:   # cutting a neighbour out can leave notches and slivers
             geom = _open(geom.buffer(0), float(rc["spike_m"]))
+            if len(geom.exterior.coords) > 5 and not geom.is_empty:   # notched by a neighbour: a clean rectangle
+                rect = inscribed_rectangle(geom, float(theta[i]))      # inside (keeps the gap) if it keeps the area
+                if not rect.is_empty and rect.area >= float(rc["inscribed_min_share"]) * geom.area:
+                    geom = rect
         if not geom.is_empty and geom.area >= float(rc["min_area_m2"]):
             kept[i] = geom
     out = g[[k is not None for k in kept]].copy()

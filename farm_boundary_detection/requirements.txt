@@ -17,4 +17,3 @@ matplotlib>=3.7
 torch>=2.1
 torchvision>=0.16
 pytest>=7.0
-segmentation-models-pytorch>=0.5   # only for model.arch: ftp_unet (pretrained Fields of the Planet U-Net)
