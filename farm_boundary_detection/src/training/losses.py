@@ -69,7 +69,8 @@ class MultiTaskLoss(nn.Module):
         self.gamma = float(lc.get("focal_gamma", 2.0))
         sep = lc.get("separation") or {}
         self.use_weight_map = bool((lc.get("boundary_aware") or {}).get("w0", 0)) or \
-            bool(sep.get("enabled", False) and sep.get("weight", 0))
+            bool(sep.get("enabled", False) and sep.get("weight", 0)) or \
+            bool((lc.get("small_farm") or {}).get("enabled", False))
         self.ld = float(lc.get("lambda_distance", 1.0))
         self.head3 = str(cfg.model.get("head", "two")) == "softmax3"
         s3 = lc.get("softmax3") or {}

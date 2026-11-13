@@ -99,15 +99,22 @@ grid of tiles (T01, T02, ...). Set `ZONE_FILE`, `ZONE_NAME` and `DATASET_NAME` a
    epochs, last epoch kept (the scored fold never picks the model). A recipe replaces the baseline only if it is
    better overall by `MIN_GAIN` **and** in `MIN_FOLD_WINS` of the folds. (Round 3 chose on 4 validation patches and
    chose wrongly.)
-2. **Recipes compared** (each adds one change, all fine-tuned from the round-2 model; batch-norm statistics are
-   re-estimated on the area's scenes first, `train.bn_recalibrate`):
-   `R2_as_is` (no training) · `C0_baseline` · `C1_separation` (`loss.separation`) · `C2_softmax3`
-   (`model.head: softmax3`).
+2. **Candidates** (all fine-tuned from the round-2 model; batch-norm statistics are re-estimated on the area's
+   scenes first, `train.bn_recalibrate`): `R2_as_is` (no training; the one to beat) · `C1_separation` (one date,
+   `loss.separation`) · `D1_two_dates` (**two dates as one 16-band input**, [`src/data/stack.py`](src/data/stack.py))
+   · `D2_two_dates_small` (+ `loss.small_farm`). The two-date models start from the round-2 model with its first-layer
+   filters copied to both dates, and train with the dates randomly swapped or one blanked
+   (`augmentation.date_bands / swap_dates / date_dropout`).
 3. **Map**: the K models of the chosen recipe are averaged; every date is predicted and the probabilities averaged;
    digitised farms are kept and model farms added only where new. Output `zone/kmz/<area>_farms.kmz`, one folder per
    tile: magenta = digitised, green = model (likely), orange = model (check).
 
-**Why these two recipes.** Error analysis of the round-3 Salama model on 862 held-out farms: 43% of farms were merged
+**Round 4 result** (Salama, 1,128 farms, out-of-fold object F1): round-2 model as it is 0.334 · fine-tuned 0.312 ·
++ separation 0.325 (fewer merged and split farms than plain fine-tuning) · 3-class head 0.255. Fine-tuning on one
+area alone over-fits; the 3-class head was dropped. 45% of the area's farms are under 0.25 ha and only 1–10% of
+them were found, which is what the two-date input and the small-farm weighting target.
+
+**Why the separation target.** Error analysis of the round-3 Salama model on 862 held-out farms: 43% of farms were merged
 with a neighbour (54–67% of plots under 0.25 ha), only 12.5% missed. The model painted 55% of the strips between
 neighbouring farms (paths, hedges, edges) as farm, although those strips are visible in the imagery (edge strength
 1.4–1.6× a farm interior); stricter polygon thresholds made it worse, so the fix belongs in training.
@@ -115,6 +122,8 @@ neighbouring farms (paths, hedges, edges) as farm, although those strips are vis
 | Setting | What it does | Source |
 |---|---|---|
 | `loss.separation` | Background pixels with two different farms within 5 px become boundary targets and get +10 weight in the interior loss: filling the gap between neighbours is costly. | U-Net weight maps for touching objects (Ronneberger et al. 2015) |
+| Two-date input (`src/data/stack.py`) | The dates' scenes are mosaicked onto one grid and stacked (date 1 bands, then date 2 bands); a pixel cloudy or missing on either date is nodata. | Neighbouring plots differ in crop / planting time across the season: U-TAE (ICCV 2021), PRUE and Fields of the Planet use two seasons |
+| `loss.small_farm` | Pixels of a farm weigh `clip(sqrt(0.25 ha / farm area), 1, 4)` in the interior loss (farms cut by the patch edge keep 1). | Small plots are under-represented in the loss: a 0.1 ha farm has 1/10 the pixels of a 1 ha farm |
 | `model.head: softmax3` + `loss.softmax3` | One softmax over background / interior / boundary, class weights 0.05 / 0.2 / 0.75, cross-entropy + log-cosh Dice. Returned as the same two outputs, so prediction and polygons are unchanged. | PRUE, CVPR 2026: boundary weighting and log-cosh Dice were the largest gains |
 
 **Individual, straight, separated farms** (`postprocess.regularize`, [`src/gis/regularize.py`](src/gis/regularize.py)),

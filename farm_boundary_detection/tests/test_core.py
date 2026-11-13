@@ -481,3 +481,59 @@ def test_regularize_notched_by_neighbour_becomes_rectangle_inside():
     assert len(gb.exterior.coords) == 5                          # rectangle, not an L with a notch
     assert ga.distance(gb) >= 0.99                               # gap kept
     assert gb.area >= 0.85 * (b.area - b.intersection(a.buffer(1)).area)
+
+
+def test_regularize_survives_invalid_polygons():
+    """Self-crossing and self-touching outlines (as watershed tracing can produce) must not stop the map."""
+    import geopandas as gpd
+    from shapely.geometry import Polygon, box
+    from src.gis.regularize import regularize
+
+    o = (260000.0, 9990000.0)
+    bowtie = Polygon([(o[0], o[1]), (o[0] + 40, o[1] + 40), (o[0] + 40, o[1]), (o[0], o[1] + 40)])     # self-crossing
+    touch = Polygon([(o[0] + 50, o[1]), (o[0] + 90, o[1]), (o[0] + 90, o[1] + 40), (o[0] + 70, o[1] + 20),
+                     (o[0] + 70, o[1] + 40), (o[0] + 50, o[1] + 40), (o[0] + 70, o[1] + 20)])         # touches itself
+    ok = box(o[0] + 100, o[1], o[0] + 140, o[1] + 40)
+    g = gpd.GeoDataFrame({"score": [0.9, 0.8, 0.7]}, geometry=[bowtie, touch, ok], crs="EPSG:32737")
+    assert not g.is_valid.all()
+    out = regularize(g, {"gap_m": 1.0, "min_area_m2": 50}, taken=box(o[0] - 50, o[1] - 50, o[0] - 10, o[1] - 10))
+    assert len(out) >= 2 and out.is_valid.all()
+
+
+def test_stack_dates_and_tiled_warm_start(tmp_path):
+    """Two dates -> one 2n-band image + all-dates-clear mask; a model with 2x the bands warm-starts from the
+    single-date model with its first-layer filters copied to both dates (same output on identical dates)."""
+    import numpy as np
+    import rasterio
+    import torch
+    from rasterio.transform import from_origin
+    from src.data.stack import stack_dates
+    from src.models.multi_task_unet import MultiTaskResUNet
+
+    tr = from_origin(260000, 9990000, 3, 3)
+    for d, val in (("20260714", 100), ("20260907", 200)):
+        img = np.full((8, 20, 30), val, np.uint16); img[:, :, :3] = 0                 # no data in 3 columns
+        with rasterio.open(tmp_path / f"{d}_075723_51_255d_3B_AnalyticMS_SR_8b_clip.tif", "w", driver="GTiff",
+                           width=30, height=20, count=8, dtype="uint16", crs="EPSG:32737", transform=tr, nodata=0) as f:
+            f.write(img)
+        udm = np.ones((1, 20, 30), np.uint8); udm[0, :5, 10:12] = 0 if d == "20260907" else 1   # a cloud on date 2
+        with rasterio.open(tmp_path / f"{d}_075723_51_255d_3B_udm2_clip.tif", "w", driver="GTiff", width=30,
+                           height=20, count=1, dtype="uint8", crs="EPSG:32737", transform=tr) as f:
+            f.write(udm)
+    out = stack_dates(sorted(tmp_path.glob("*SR_8b_clip.tif")), tmp_path / "stack", "zone2d")
+    with rasterio.open(out) as s:
+        a = s.read(); assert s.count == 16 and s.descriptions[8].endswith("_d2")
+    assert (a[:8, 10, 15] == 100).all() and (a[8:, 10, 15] == 200).all()
+    assert (a[:, :, :3] == 0).all() and (a[:, 0, 10] == 0).all()                         # missing / cloudy: nodata
+    with rasterio.open(out.with_name("zone2d_3B_udm2_clip.tif")) as s:
+        m = s.read(1); assert m[10, 15] == 1 and m[0, 10] == 0
+
+    one = MultiTaskResUNet(8, "resnet18", pretrained=False, decoder_channels=(32, 16, 16, 8)).eval()
+    two = MultiTaskResUNet(16, "resnet18", pretrained=False, decoder_channels=(32, 16, 16, 8)).eval()
+    src, own = one.state_dict(), two.state_dict()
+    for k, v in src.items():
+        own[k] = v.repeat(1, 2, 1, 1) / 2 if own[k].shape != v.shape else v
+    two.load_state_dict(own)
+    x = torch.randn(1, 8, 32, 32)
+    with torch.no_grad():
+        assert torch.allclose(one(x)[0], two(torch.cat([x, x], 1))[0], atol=1e-4)

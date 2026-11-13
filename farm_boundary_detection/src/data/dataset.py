@@ -123,7 +123,7 @@ class FarmPatchDataset(Dataset):
 
     def __init__(self, processed_dir: str | Path, patch_ids: list[str], normalizer: Normalizer,
                  augment: dict | None = None, boundary_aware: dict | None = None, seed: int = 0,
-                 distance: bool = False, separation: dict | None = None):
+                 distance: bool = False, separation: dict | None = None, small_farm: dict | None = None):
         self.dir = Path(processed_dir)
         self.ids = list(patch_ids)
         if not self.ids:
@@ -134,6 +134,7 @@ class FarmPatchDataset(Dataset):
         self.seed = seed
         self.distance = distance
         self.sep = separation if separation and separation.get("enabled", False) else None
+        self.small = small_farm if small_farm and small_farm.get("enabled", False) else None
         missing = [p for p in self.ids[:20] if not (self.dir / "images" / f"{p}.tif").exists()]
         if missing:
             raise FileNotFoundError(f"patch files missing in {self.dir}/images, e.g. {missing[:3]}")
@@ -148,7 +149,7 @@ class FarmPatchDataset(Dataset):
     def load_raw(self, pid: str) -> dict[str, np.ndarray]:
         raw = {"image": self._read("images", pid), "interior": self._read("interior_masks", pid)[0],
                "boundary": self._read("boundary_masks", pid)[0], "valid": self._read("valid_masks", pid)[0]}
-        if self.distance or self.sep:
+        if self.distance or self.sep or self.small:
             raw["instance"] = self._read("instance_masks", pid)[0]
         return raw
 
@@ -172,6 +173,22 @@ class FarmPatchDataset(Dataset):
             masks = [ndi.rotate(m, ang, axes=(-1, -2), reshape=False, order=0, mode="constant", cval=0) for m in masks]
             arrs = [img, *masks]  # corners rotated in from outside have valid = 0
         return [np.ascontiguousarray(x) for x in arrs]
+
+    @staticmethod
+    def _dates(x: np.ndarray, rng: np.random.Generator, a: dict) -> np.ndarray:
+        """Multi-date input (``date_bands`` bands per date): random order of the dates (``swap_dates``) and,
+        sometimes, one date blanked (``date_dropout``), so the network uses every date and still works when one
+        is missing (PRUE / Fields of the Planet augmentations)."""
+        n = int(a.get("date_bands") or 0)
+        if n <= 0 or x.shape[0] % n or x.shape[0] == n:
+            return x
+        dates = x.reshape(x.shape[0] // n, n, *x.shape[1:])
+        if rng.random() < float(a.get("swap_dates", 0)):
+            dates = dates[rng.permutation(len(dates))]
+        if rng.random() < float(a.get("date_dropout", 0)):
+            dates = dates.copy()
+            dates[int(rng.integers(len(dates)))] = 0.0          # 0 = the training mean after z-scoring
+        return np.ascontiguousarray(dates.reshape(x.shape))
 
     @staticmethod
     def _radiometric(x: np.ndarray, ok: np.ndarray, rng: np.random.Generator, a: dict) -> np.ndarray:
@@ -199,6 +216,7 @@ class FarmPatchDataset(Dataset):
                 [x, interior, boundary, valid, ok.astype(np.uint8), instance], rng, self.aug)
             # image pixels outside the labelled region are still real context: augment every DATA pixel
             x = self._radiometric(x, data.astype(bool), rng, self.aug)
+            x = self._dates(x, rng, self.aug)
             valid = (valid.astype(bool) & data.astype(bool)).astype(np.uint8)
         strip = None
         if self.sep:    # the strips between neighbouring farms: part of the boundary target, and costly to fill
@@ -208,6 +226,17 @@ class FarmPatchDataset(Dataset):
         weight = boundary_weight_map(boundary, float(self.ba.get("w0", 0)), float(self.ba.get("sigma_px", 2.0)))
         if strip is not None and float(self.sep.get("weight", 0)) > 0:
             weight = np.where(strip, weight + float(self.sep["weight"]), weight).astype(np.float32)
+        if self.small:   # small farms count more: w = clip(sqrt(ref / farm pixels), 1, max_weight)
+            gsd = float(self.norm.stats.get("gsd_m") or 3.0)
+            ref_px = float(self.small.get("ref_ha", 0.25)) * 1e4 / (gsd * gsd)
+            ids, counts = np.unique(instance[instance > 0], return_counts=True)
+            if len(ids):
+                w_farm = np.clip(np.sqrt(ref_px / counts), 1.0, float(self.small.get("max_weight", 4.0)))
+                edge = np.unique(np.concatenate([instance[0], instance[-1], instance[:, 0], instance[:, -1]]))
+                w_farm[np.isin(ids, edge)] = 1.0      # cut by the patch edge: not necessarily small
+                lut = np.ones(int(instance.max()) + 1, np.float32)
+                lut[ids] = w_farm
+                weight = (weight * lut[np.clip(instance, 0, None)]).astype(np.float32)
         item = {
             "image": torch.from_numpy(x.astype(np.float32)),
             "interior_mask": torch.from_numpy((interior > 0).astype(np.float32))[None],
@@ -246,7 +275,8 @@ def make_dataset(cfg, split: str, augment: bool | None = None, table: pd.DataFra
     aug = dict(cfg.augmentation) if (augment if augment is not None else split == "train") else None
     return FarmPatchDataset(cfg.paths.processed_dir, ids, norm, aug, dict(cfg.loss.get("boundary_aware") or {}),
                             int(cfg.project.seed), distance=bool(cfg.model.get("distance_head", False)),
-                            separation=dict(cfg.loss.get("separation") or {}))
+                            separation=dict(cfg.loss.get("separation") or {}),
+                            small_farm=dict(cfg.loss.get("small_farm") or {}))
 
 
 def make_dataloader(cfg, split: str, shuffle: bool | None = None, augment: bool | None = None,

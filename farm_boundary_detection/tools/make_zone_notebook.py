@@ -21,14 +21,17 @@ Give it an area drawn in Google Earth Pro (a KMZ in `data/zones/`) and the priva
 it (+ the round-2 model). It compares training recipes on **every** digitised farm of the area, picks the best one
 only if the gain is real, and maps the area.
 
-**What is compared** (each one change on top of the previous; all start from the round-2 model):
+**What is compared** (all start from the round-2 model; the round-2 model itself is the one to beat):
 
-| Candidate | Change | Why (round-3 error analysis / literature) |
-|---|---|---|
-| `R2_as_is` | round-2 model, no training | reference |
-| `C0_baseline` | fine-tuned on the area's farms (the round-3 recipe) | what was used so far |
-| `C1_separation` | + the strips between neighbouring farms are boundary targets and 10x costly to fill | 43% of farms were merged with a neighbour; the model painted 55% of those strips as farm, although they are visible in the imagery (U-Net weight maps for touching objects) |
-| `C2_softmax3` | + one softmax over 3 exclusive classes (background / interior / boundary), boundary weighted most, log-cosh Dice | PRUE (CVPR 2026): boundary weighting and log-cosh Dice were the largest gains for field boundaries |
+| Candidate | Input | Change | Why |
+|---|---|---|---|
+| `R2_as_is` | 1 date | round-2 model, no training | best so far (round 4: object F1 0.334 on 1,128 Salama farms) |
+| `C1_separation` | 1 date | fine-tuned with the separation target | round 4: fewer merged farms than plain fine-tuning (0.325) |
+| `D1_two_dates` | **2 dates** (16 bands) | July + September stacked as one input, + separation | neighbouring plots that look alike on one date often differ in crop / planting time (U-TAE, PRUE, Fields of the Planet use two seasons) |
+| `D2_two_dates_small` | **2 dates** | + small farms weigh up to 4x in the loss | 45% of Salama farms are under 0.25 ha, and only 1-10% of them were found |
+
+The two-date models start from the round-2 model with its first-layer filters copied to both dates, and are trained
+with the dates randomly swapped or one blanked, so they use both.
 
 **How they are compared: spatial K-fold cross-validation.** The area's ground blocks are dealt into K folds with
 similar numbers of farms. Each candidate is trained K times, each time on K-1 folds, and predicts the fold it did not
@@ -60,6 +63,7 @@ K_FOLDS = 4
 BLOCK_SIZES_M = [2000, 1500, 1000]   # the first that gives >= 3 farm blocks per fold is used
 EPOCHS = 15               # fixed (no early stopping): the last epoch is scored
 USE_TTA = True            # flip averaging when scoring and mapping
+MAX_DATES = 2             # two-date candidates: the dates with the most scenes (scenes of one date are mosaicked)
 MIN_GAIN = 0.01           # a candidate must beat the baseline by this object F1 ...
 MIN_FOLD_WINS = 0.75      # ... and in at least this share of the folds
 MAP_TILES = None          # None = every tile; or e.g. ["T04", "T11"]
@@ -157,7 +161,7 @@ NEG = [f"paths.complete_areas={NO_FARM}", "patches.background_keep_fraction=0.5"
 print("no-farm / complete areas:", NO_FARM.name if NO_FARM else "none")
 
 QUICK = ["train.max_train_patches=16", "evaluation.n_visuals=2"] if QUICK_TEST else []
-BASE = [f"paths.imagery_dir={DATA}", f"paths.labels_dir={ZONE_LABELS}", f"split.block_size_m={BLOCK_M}",
+BASE = [f"paths.labels_dir={ZONE_LABELS}", f"split.block_size_m={BLOCK_M}",
         "split.fractions={train: 0.75, val: 0.25, test: 0.0}",
         "patches.size=256", "patches.stride=128", "patches.eval_stride=256", "patches.min_farm_pixels=150",
         "inference.patch_size=512", "inference.overlap=128", "inference.batch_size=4",
@@ -166,21 +170,26 @@ BASE = [f"paths.imagery_dir={DATA}", f"paths.labels_dir={ZONE_LABELS}", f"split.
         f"model.psp_pooling={str(bool(mk['psp_pooling'])).lower()}",
         f"model.condition_interior_on_boundary={str(bool(mk['condition_interior_on_boundary'])).lower()}",
         "train.num_workers=4", f"train.epochs={EPOCHS}", "train.patience=null", "train.run_checks=false", *NEG]
-FT = [f"train.init_from={BASE_MODEL}", "train.lr=0.0001", "train.warmup_epochs=1", "train.batch_size=16"]
-# candidate -> overrides (None = the round-2 model as it is); each adds one change to the one before
+FT = [f"train.init_from={BASE_MODEL}", "train.lr=0.0001", "train.warmup_epochs=1", "train.batch_size=16",
+      "loss.separation.enabled=true"]
+TWO = ["augmentation.date_bands=8", "augmentation.swap_dates=0.5", "augmentation.date_dropout=0.15"]
+# candidate -> (input, overrides); None = the round-2 model as it is
 CANDIDATES = {
-    "R2_as_is":      None,
-    "C0_baseline":   FT,
-    "C1_separation": FT + ["loss.separation.enabled=true"],
-    "C2_softmax3":   FT + ["loss.separation.enabled=true", "model.head=softmax3"],
+    "R2_as_is":           ("single", None),
+    "C1_separation":      ("single", FT),
+    "D1_two_dates":       ("stack", FT + TWO),
+    "D2_two_dates_small": ("stack", FT + TWO + ["loss.small_farm.enabled=true"]),
 }
-BASELINE = "C0_baseline"
+BASELINE = "R2_as_is"          # the model to beat
+STACK_DIR = SCRATCH / "stack"  # the two-date image (built in step 4)
 
-def make_cfg(fold, cand=None, extra=()):
-    run = WORK / "experiments" / (cand or "_none") / f"fold{fold}"
-    over = BASE + [f"paths.processed_dir={SCRATCH / 'prep' / f'fold{fold}'}", f"paths.models_dir={run / 'models'}",
+def make_cfg(fold, cand=None, extra=(), prep=None):
+    prep = prep or (CANDIDATES[cand][0] if cand else "single")
+    run = WORK / "experiments" / (cand or f"_{prep}") / f"fold{fold}"
+    over = BASE + [f"paths.imagery_dir={DATA if prep == 'single' else STACK_DIR}",
+                   f"paths.processed_dir={SCRATCH / 'prep' / prep / f'fold{fold}'}", f"paths.models_dir={run / 'models'}",
                    f"paths.outputs_dir={run / 'outputs'}", f"paths.logs_dir={WORK / 'logs'}",
-                   *((CANDIDATES.get(cand) or []) if cand else []), *extra, *QUICK]
+                   *((CANDIDATES[cand][1] or []) if cand else []), *extra, *QUICK]
     return load_config(PROJECT / "configs" / "config.yaml", over)
 
 def hours_left():
@@ -188,22 +197,31 @@ def hours_left():
 ''')
 
 md(r"""
-## 4. Prepare the folds
+## 4. The two-date image, then the folds
 
-Masks are built once; then for each fold the patches are cut so that training and validation patches never share
-ground. Fold k's validation patches are the farms that fold-k models are scored on.
+The scenes are grouped by date and stacked into one 16-band image (date 1 bands, then date 2 bands; a pixel cloudy
+or missing on either date is left out). Masks are built once per input; then for each fold the patches are cut so
+training and validation never share ground. Both inputs use the same folds, so every candidate is scored on the same
+farms.
 """)
 code(r'''
+from src.data.stack import stack_dates
 from src.training.crossval import prepare_folds
-fold_table = prepare_folds(lambda f: make_cfg(f), K_FOLDS)
-display(fold_table)
-meta0 = SCRATCH / "prep" / "fold0" / "metadata"
+PREPS = sorted({CANDIDATES[c][0] for c in CANDIDATES})
+STACK = None
+if "stack" in PREPS:
+    STACK = stack_dates(tifs, STACK_DIR, f"{ZONE_NAME}2d", max_dates=MAX_DATES)
+fold_tables = {prep: prepare_folds(lambda f, prep=prep: make_cfg(f, prep=prep), K_FOLDS) for prep in PREPS}
+for prep, t in fold_tables.items():
+    print(prep); display(t)
+meta0 = SCRATCH / "prep" / "single" / "fold0" / "metadata"
 checks = pd.DataFrame(json.loads((meta0 / "validation_report.json").read_text()))[["check", "ok", "message"]]
 display(checks)
-vis = SCRATCH / "prep" / "fold0" / "visualizations"
+vis = SCRATCH / "prep" / "single" / "fold0" / "visualizations"
 mask_figs = [shutil.copy(f, REPORT / f.name) for f in sorted(vis.glob("*_masks.png"))[:2]]
 for f in mask_figs:
     display(Image(filename=str(f), width=1300))
+fold_table = pd.concat(fold_tables, names=["input"])
 print(f"{hours_left():.1f} h left")
 ''')
 
@@ -213,7 +231,7 @@ from src.training.crossval import train_fold
 from src.utils.visualization import plot_history, plot_training_curves
 
 models = {}
-runs = [(c, f) for c in CANDIDATES if CANDIDATES[c] is not None for f in range(K_FOLDS)]
+runs = [(c, f) for c in CANDIDATES if CANDIDATES[c][1] is not None for f in range(K_FOLDS)]
 for i, (cand, f) in enumerate(runs):
     budget = (hours_left() - 1.5) / (len(runs) - i)            # keep 1.5 h for scoring and the map
     if budget < 0.05 and not QUICK_TEST:
@@ -242,29 +260,32 @@ from src.training.crossval import out_of_fold, per_fold_scores, choose, save_sum
 from src.training.evaluation import tune_postprocess, evaluate, true_areas
 from src.utils.visualization import plot_comparison
 
-fold_cfgs = [make_cfg(f) for f in range(K_FOLDS)]
-AREAS = true_areas(fold_cfgs[0])
+fold_cfgs = {prep: [make_cfg(f, prep=prep) for f in range(K_FOLDS)] for prep in PREPS}
+AREAS = true_areas(fold_cfgs["single"][0])
 SMALL = dict(stage1={"seed_source": ["boundary", "edt"], "seed_threshold": [0.5], "min_seed_px": [25]},
              stage2={"interior_threshold": [0.4], "boundary_threshold": [0.5], "min_area_m2": [200]}) if QUICK_TEST else {}
 rows, tuned, fold_f1 = {}, {}, {}
 for cand, mlist in models.items():
-    oof = out_of_fold(fold_cfgs, mlist, USE_TTA)
-    pc, _ = tune_postprocess(fold_cfgs[0], oof, SMALL.get("stage1"), SMALL.get("stage2"))
-    res = evaluate(fold_cfgs[0], None, "out-of-fold", WORK / "evaluation" / cand, postprocess=pc, cache=oof,
+    fc = fold_cfgs[CANDIDATES[cand][0]]
+    oof = out_of_fold(fc, mlist, USE_TTA)
+    pc, _ = tune_postprocess(fc[0], oof, SMALL.get("stage1"), SMALL.get("stage2"))
+    res = evaluate(fc[0], None, "out-of-fold", WORK / "evaluation" / cand, postprocess=pc, cache=oof,
                    areas=AREAS, title=cand)
-    folds = per_fold_scores(oof, pc, float(fold_cfgs[0].evaluation.instance_iou))
+    folds = per_fold_scores(oof, pc, float(fc[0].evaluation.instance_iou))
+    small = res["by_size"]
+    rows_small = {r["size"]: r["recall"] for r in small} if small and "size" in small[0] else {}
     tuned[cand], fold_f1[cand] = pc, folds["object_f1"]
     rows[cand] = {**{k: res[k] for k in ("object_f1", "object_precision", "object_recall", "mean_matched_iou",
                                           "merged_predictions", "split_farms", "interior_iou", "boundary_f1",
                                           "farms_true")},
                   "f1_fold_min": folds["object_f1"].min(), "f1_fold_max": folds["object_f1"].max(),
+                  "recall_<0.1ha": rows_small.get("<0.1 ha"), "recall_0.1-0.25ha": rows_small.get("0.1-0.25 ha"),
                   **{f"pp_{k}": pc[k] for k in ("seed_source", "seed_threshold", "min_seed_px", "interior_threshold",
                                                 "min_area_m2")}}
     oof["items"].clear()
 comparison = pd.DataFrame(rows).T
 folds_f1 = pd.DataFrame(fold_f1)
-CHOSEN = choose(comparison, folds_f1, BASELINE if BASELINE in comparison.index else comparison.index[0],
-                MIN_GAIN, MIN_FOLD_WINS)
+CHOSEN = choose(comparison, folds_f1, BASELINE, MIN_GAIN, MIN_FOLD_WINS)
 save_summary(WORK, comparison, folds_f1, CHOSEN)
 comparison.to_csv(WORK / "comparison_out_of_fold.csv")
 comp_png = plot_comparison(comparison, REPORT / "comparison.png")
@@ -287,11 +308,12 @@ as is), **green** = model, likely farm, **orange** = model, check first.
 code(r'''
 from src.gis.zone import run_zone
 pp = tuned[CHOSEN]
-cfg_map = make_cfg(0, CHOSEN if CANDIDATES.get(CHOSEN) else None)
+cfg_map = make_cfg(0, CHOSEN)
 cfg_map.postprocess = pp
 cfg_map.inference.tta = USE_TTA
 MAP_MODELS = models[CHOSEN] if CHOSEN != "R2_as_is" else BASE_MODEL
-zres = run_zone(cfg_map, MAP_MODELS, PROJECT / ZONE_FILE, tifs, WORK / "zone", ZONE_NAME, digitised=labels_all,
+MAP_IMAGES = [STACK] if CANDIDATES[CHOSEN][0] == "stack" else tifs
+zres = run_zone(cfg_map, MAP_MODELS, PROJECT / ZONE_FILE, MAP_IMAGES, WORK / "zone", ZONE_NAME, digitised=labels_all,
                 only_tiles=(tiles.tile.iloc[:1].tolist() if QUICK_TEST else MAP_TILES),
                 max_area_ha=MAX_FARM_HA, min_compact=MIN_COMPACT)
 farms = zres["farms"]

@@ -111,6 +111,9 @@ augmentation:
   brightness: 0.10            # additive, in standard deviations
   contrast: 0.10              # multiplicative
   noise_std: 0.03
+  date_bands: 0               # multi-date input (src/data/stack.py): bands per date (8 = SuperDove); 0 = single date
+  swap_dates: 0.5             # probability of shuffling the order of the dates
+  date_dropout: 0.15          # probability of blanking one date
   gain: 0.0                   # one random factor 1 +- gain for all bands (illumination / correction drift)
 
 # ---------------------------------------------------------------- model
@@ -147,6 +150,10 @@ loss:
     window_px: 5              # a background pixel with two different farms within this square is a strip pixel
     as_boundary: true         # strip pixels are also boundary targets (the boundary head learns the visible strip)
     weight: 10.0              # extra interior-loss weight on strip pixels: filling them is costly
+  small_farm:                 # pixels of small farms weigh more in the interior loss (the model missed 90-99%
+    enabled: false            # of farms under 0.25 ha): w = clip(sqrt(ref / farm area), 1, max_weight)
+    ref_ha: 0.25
+    max_weight: 4.0
   boundary_aware:             # interior BCE pixel weight w = 1 + w0 * exp(-d^2 / (2 sigma^2)),
     w0: 4.0                   # d = distance (px) to the nearest true boundary: learning to stop exactly at
     sigma_px: 2.0             # a farm edge matters most for separating neighbours

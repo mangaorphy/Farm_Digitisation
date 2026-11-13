@@ -30,7 +30,9 @@ import math
 
 import geopandas as gpd
 import numpy as np
+import shapely
 from shapely import affinity
+from shapely.errors import GEOSException
 from shapely.geometry import Polygon, box
 
 log = logging.getLogger(__name__)
@@ -45,6 +47,27 @@ def _largest(geom) -> Polygon:
     return max(parts, key=lambda p: p.area) if parts else Polygon()
 
 
+def _valid(geom) -> Polygon:
+    """Largest polygon of a repaired geometry (self-touching or self-crossing outlines become valid)."""
+    if geom is None or geom.is_empty:
+        return Polygon()
+    if not geom.is_valid:
+        geom = shapely.make_valid(geom)
+    return _largest(geom)
+
+
+def _safe(op, a, b):
+    """``a.<op>(b)`` that survives GEOS topology errors: repaired inputs, then a 1 cm precision grid."""
+    try:
+        return getattr(a, op)(b)
+    except GEOSException:
+        a, b = _valid(a), _valid(b) if b.geom_type == "Polygon" else shapely.make_valid(b)
+        try:
+            return getattr(a, op)(b)
+        except GEOSException:
+            return getattr(a, op)(b, grid_size=0.01)
+
+
 def _open(geom, width: float) -> Polygon:
     """Morphological opening with square joins: removes spikes and slivers thinner than ``width``, keeps right
     angles. Returns the largest remaining part (the input itself if opening would erase it)."""
@@ -53,7 +76,8 @@ def _open(geom, width: float) -> Polygon:
     d = width / 2
     # mitre joins can re-grow a sharp corner past the original outline: clip back to it, so opening never
     # takes area from a neighbour or from the gap
-    out = _largest(geom.buffer(-d, join_style="mitre").buffer(d, join_style="mitre").intersection(geom))
+    geom = _valid(geom)
+    out = _largest(_safe("intersection", geom.buffer(-d, join_style="mitre").buffer(d, join_style="mitre"), geom))
     out = out if not out.is_empty else _largest(geom)
     return _largest(out.simplify(0.001, preserve_topology=True))     # drop in-line vertices left by clipping
 
@@ -210,7 +234,16 @@ def inscribed_rectangle(geom: Polygon, theta: float, res: float = 1.0) -> Polygo
 
 
 def straighten(poly: Polygon, theta: float, rc: dict) -> Polygon:
-    """One polygon -> straight-edged version in direction ``theta`` (degrees)."""
+    """One polygon -> straight-edged version in direction ``theta`` (degrees). Never raises: a degenerate outline
+    (self-touching, self-crossing) is repaired, and if straightening still fails it is kept simplified."""
+    try:
+        return _straighten(_valid(poly), theta, rc)
+    except (GEOSException, ValueError) as e:
+        log.debug("straighten failed (%s): simplified outline kept", e)
+        return _valid(_valid(poly).simplify(float(rc["simplify_m"]), preserve_topology=True))
+
+
+def _straighten(poly: Polygon, theta: float, rc: dict) -> Polygon:
     if poly.is_empty or poly.area <= 0:
         return poly
     poly = _largest(poly.buffer(0))
@@ -263,12 +296,12 @@ def regularize(model: gpd.GeoDataFrame, rc: dict | None = None, taken=None,
             continue
         geom = geom.buffer(-gap / 2, join_style="mitre")               # half the gap on each side
         if blocked is not None and geom.intersects(blocked):
-            geom = geom.difference(blocked)
+            geom = _safe("difference", geom, blocked)
         for j in sidx.query(straight[i], predicate="intersects"):
             if j < i and kept[j] is not None:
                 ring = kept[j].buffer(gap, join_style="mitre")
                 if geom.intersects(ring):
-                    geom = geom.difference(ring)
+                    geom = _safe("difference", geom, ring)
         if not geom.is_empty:   # cutting a neighbour out can leave notches and slivers
             geom = _open(geom.buffer(0), float(rc["spike_m"]))
             if len(geom.exterior.coords) > 5 and not geom.is_empty:   # notched by a neighbour: a clean rectangle

@@ -151,10 +151,23 @@ class Trainer:
             raise FileNotFoundError(f"train.init_from not found: {path}")
         src = load_checkpoint(path, self.device)["state_dict"]
         own = self.net.state_dict()
-        ok = {k: v for k, v in src.items() if k in own and own[k].shape == v.shape}
+        ok, tiled = {}, []
+        for k, v in src.items():
+            if k not in own:
+                continue
+            if own[k].shape == v.shape:
+                ok[k] = v
+            elif (v.dim() == 4 and own[k].dim() == 4 and own[k].shape[0] == v.shape[0] and
+                  own[k].shape[2:] == v.shape[2:] and own[k].shape[1] % v.shape[1] == 0):
+                # more input bands (e.g. 2 dates x 8 bands): every date gets the learned filters, divided by
+                # the number of dates, so the layer starts out seeing the average of the dates
+                n = own[k].shape[1] // v.shape[1]
+                ok[k] = v.repeat(1, n, 1, 1) / n
+                tiled.append(k)
         self.net.load_state_dict(ok, strict=False)
-        log.info("initialised %d / %d tensors from %s (%d skipped: missing or different shape)",
-                 len(ok), len(own), path, len(own) - len(ok))
+        log.info("initialised %d / %d tensors from %s (%d skipped: missing or different shape)%s",
+                 len(ok), len(own), path, len(own) - len(ok),
+                 f"; first-layer filters copied to every date: {tiled}" if tiled else "")
 
     @torch.no_grad()
     def _recalibrate_bn(self, max_batches: int = 50) -> None:
